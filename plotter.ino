@@ -1,0 +1,688 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <AccelStepper.h>
+#include <ESP32Servo.h>
+#include <cstring>
+
+constexpr int WIFI_CONNECT_TIMEOUT_MS = 20000;
+
+// Replace with your network credentials
+const char *ssid = "MAKERSPACE";
+const char *password = "12345678";
+
+// Stepper pin assignments
+constexpr int X1_STEP_PIN = 2;
+constexpr int X1_DIR_PIN = 4;
+constexpr int X2_STEP_PIN = 5;
+constexpr int X2_DIR_PIN = 18;
+constexpr int Y_STEP_PIN = 19;
+constexpr int Y_DIR_PIN = 21;
+
+// Servo configuration
+constexpr int SERVO_PIN = 27;
+constexpr int PEN_UP_ANGLE = 20;
+constexpr int PEN_DOWN_ANGLE = 90;
+
+// Motion calibration (tune for your machine)
+constexpr float STEPS_PER_PIXEL_X = 10.0f;
+constexpr float STEPS_PER_PIXEL_Y = 10.0f;
+constexpr int32_t X_OFFSET_STEPS = 0;
+constexpr int32_t Y_OFFSET_STEPS = 0;
+constexpr bool INVERT_X = false;
+constexpr bool INVERT_Y = false;
+constexpr int32_t X_MIN_STEPS = 0;
+constexpr int32_t X_MAX_STEPS = 20000;
+constexpr int32_t Y_MIN_STEPS = 0;
+constexpr int32_t Y_MAX_STEPS = 15000;
+
+// Secondary X motor (belt duplication) settings
+constexpr int8_t X2_DIRECTION = 1;   // set -1 if X2 needs to run opposite
+constexpr int32_t X2_OFFSET_STEPS = 0;
+constexpr int32_t X2_MIN_STEPS = X_MIN_STEPS;
+constexpr int32_t X2_MAX_STEPS = X_MAX_STEPS;
+
+// Motion dynamics
+constexpr float MAX_SPEED_STEPS_PER_SEC = 1200.0f;
+constexpr float ACCEL_STEPS_PER_SEC2 = 800.0f;
+constexpr int32_t MIN_STEP_DELTA = 2;
+
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+
+AccelStepper stepperX1(AccelStepper::DRIVER, X1_STEP_PIN, X1_DIR_PIN);
+AccelStepper stepperX2(AccelStepper::DRIVER, X2_STEP_PIN, X2_DIR_PIN);
+AccelStepper stepperY(AccelStepper::DRIVER, Y_STEP_PIN, Y_DIR_PIN);
+
+Servo penServo;
+bool penCurrentlyDown = false;
+
+portMUX_TYPE targetMux = portMUX_INITIALIZER_UNLOCKED;
+volatile bool newTargetQueued = false;
+volatile int32_t queuedTargetX = 0;
+volatile int32_t queuedTargetY = 0;
+volatile bool queuedPenDown = false;
+
+// Control flags
+bool motorsEnabled = false;
+bool enableLogCanvasOutput = true;
+bool enableLogMotorCommands = true;
+bool enableLogGeneral = true;
+
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+  <title>Plotter</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; background: #111; color: #f5f5f5; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+    #toolbar { position: fixed; top: 0; left: 0; right: 0; display: flex; gap: 12px; align-items: center; padding: 10px 16px; background: rgba(0, 0, 0, 0.35); backdrop-filter: blur(12px); z-index: 10; }
+    button { background: #1f1f1f; border: 1px solid #333; border-radius: 8px; color: inherit; font-size: 16px; padding: 8px 14px; cursor: pointer; }
+    button:active { background: #2e2e2e; }
+    button:hover { background: #2a2a2a; }
+    #status { margin-left: auto; font-size: 14px; opacity: 0.85; }
+    #canvas { display: block; width: 100vw; height: 100vh; cursor: crosshair; touch-action: none; }
+    #settingsPanel { position: fixed; top: 60px; right: 16px; background: rgba(0, 0, 0, 0.9); backdrop-filter: blur(12px); border: 1px solid #333; border-radius: 12px; padding: 20px; min-width: 240px; z-index: 20; display: none; box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5); }
+    #settingsPanel.open { display: block; }
+    .settings-group { margin-bottom: 20px; }
+    .settings-group:last-child { margin-bottom: 0; }
+    .settings-label { display: block; font-size: 13px; margin-bottom: 8px; opacity: 0.9; font-weight: 500; }
+    #colorPicker { width: 100%; height: 40px; border: 1px solid #444; border-radius: 8px; cursor: pointer; background: transparent; }
+    #strokeWidthInput { width: 100%; height: 36px; background: #1f1f1f; border: 1px solid #444; border-radius: 8px; color: inherit; font-size: 14px; padding: 0 12px; }
+    #strokeWidthInput:focus { outline: none; border-color: #666; }
+    .stroke-width-display { display: flex; align-items: center; gap: 10px; }
+    #strokeWidthSlider { flex: 1; height: 6px; background: #2a2a2a; border-radius: 3px; outline: none; -webkit-appearance: none; }
+    #strokeWidthSlider::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 16px; height: 16px; background: #ff5252; border-radius: 50%; cursor: pointer; }
+    #strokeWidthSlider::-moz-range-thumb { width: 16px; height: 16px; background: #ff5252; border-radius: 50%; cursor: pointer; border: none; }
+    #strokeWidthValue { min-width: 40px; text-align: right; font-size: 13px; opacity: 0.8; }
+  </style>
+</head>
+<body>
+  <div id="toolbar">
+    <button id="clearBtn">Clear</button>
+    <button id="settingsBtn">Settings</button>
+    <div id="status">Offline</div>
+  </div>
+  <div id="settingsPanel">
+    <div class="settings-group">
+      <label class="settings-label" for="colorPicker">Color</label>
+      <input type="color" id="colorPicker" value="#ff5252">
+    </div>
+    <div class="settings-group">
+      <label class="settings-label" for="strokeWidthSlider">Stroke Width</label>
+      <div class="stroke-width-display">
+        <input type="range" id="strokeWidthSlider" min="1" max="50" value="2" step="1">
+        <span id="strokeWidthValue">2</span>
+      </div>
+      <input type="number" id="strokeWidthInput" min="1" max="50" value="2" step="1">
+    </div>
+  </div>
+  <canvas id="canvas"></canvas>
+  <script>
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const statusEl = document.getElementById('status');
+    const clearBtn = document.getElementById('clearBtn');
+    const settingsBtn = document.getElementById('settingsBtn');
+    const settingsPanel = document.getElementById('settingsPanel');
+    const colorPicker = document.getElementById('colorPicker');
+    const strokeWidthSlider = document.getElementById('strokeWidthSlider');
+    const strokeWidthInput = document.getElementById('strokeWidthInput');
+    const strokeWidthValue = document.getElementById('strokeWidthValue');
+    const gateway = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`;
+    let websocket;
+    let drawing = false;
+    let lastPoint = { x: 0, y: 0 };
+    let lastSent = { x: 0, y: 0, pen: 0, time: 0 };
+    let currentDpr = 1;
+    let currentColor = '#ff5252';
+    let currentStrokeWidth = 2;
+
+    function applyCanvasSettings() {
+      ctx.lineWidth = currentStrokeWidth;
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      ctx.strokeStyle = currentColor;
+    }
+
+    function resizeCanvas() {
+      currentDpr = Math.max(1, window.devicePixelRatio || 1);
+      const width = window.innerWidth;
+      const height = window.innerHeight;
+      canvas.style.width = width + 'px';
+      canvas.style.height = height + 'px';
+      canvas.width = Math.round(width * currentDpr);
+      canvas.height = Math.round(height * currentDpr);
+      ctx.setTransform(currentDpr, 0, 0, currentDpr, 0, 0);
+      applyCanvasSettings();
+      ctx.fillStyle = '#111';
+      ctx.fillRect(0, 0, width, height);
+    }
+
+    function updateStatus(text, ok = false) {
+      statusEl.textContent = text;
+      statusEl.style.color = ok ? '#8dff6a' : '#ff8d72';
+    }
+
+    function initWebSocket() {
+      updateStatus('Connecting…', false);
+      websocket = new WebSocket(gateway);
+      websocket.onopen = () => updateStatus('Online', true);
+      websocket.onclose = () => {
+        updateStatus('Offline', false);
+        setTimeout(initWebSocket, 1500);
+      };
+      websocket.onerror = () => websocket.close();
+    }
+
+    function sendPoint(x, y, pen) {
+      if (!websocket || websocket.readyState !== WebSocket.OPEN) return;
+      const now = performance.now();
+      if (pen === lastSent.pen &&
+          Math.abs(x - lastSent.x) < 1 &&
+          Math.abs(y - lastSent.y) < 1 &&
+          now - lastSent.time < 10) {
+        return;
+      }
+      lastSent = { x, y, pen, time: now };
+      websocket.send(`${Math.round(x)}&${Math.round(y)}-${pen}`);
+    }
+
+    function getCanvasPoint(evt) {
+      const rect = canvas.getBoundingClientRect();
+      const source = evt.touches ? evt.touches[0] : evt;
+      return {
+        x: source.clientX - rect.left,
+        y: source.clientY - rect.top
+      };
+    }
+
+    function startDraw(evt) {
+      evt.preventDefault();
+      drawing = true;
+      lastPoint = getCanvasPoint(evt);
+      applyCanvasSettings();
+      ctx.beginPath();
+      ctx.moveTo(lastPoint.x, lastPoint.y);
+      sendPoint(lastPoint.x, lastPoint.y, 1);
+    }
+
+    function moveDraw(evt) {
+      if (!drawing) return;
+      evt.preventDefault();
+      const point = getCanvasPoint(evt);
+      ctx.lineTo(point.x, point.y);
+      ctx.stroke();
+      lastPoint = point;
+      sendPoint(point.x, point.y, 1);
+    }
+
+    function endDraw(evt) {
+      if (!drawing) return;
+      evt.preventDefault();
+      drawing = false;
+      sendPoint(lastPoint.x, lastPoint.y, 0);
+    }
+
+    clearBtn.addEventListener('click', () => {
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.restore();
+      ctx.fillStyle = '#111';
+      ctx.fillRect(0, 0, canvas.width / currentDpr, canvas.height / currentDpr);
+      ctx.beginPath();
+      lastSent = { x: 0, y: 0, pen: 0, time: 0 };
+    });
+
+    settingsBtn.addEventListener('click', () => {
+      settingsPanel.classList.toggle('open');
+    });
+
+    colorPicker.addEventListener('input', (e) => {
+      currentColor = e.target.value;
+      applyCanvasSettings();
+    });
+
+    function updateStrokeWidth(value) {
+      const numValue = Math.max(1, Math.min(50, parseInt(value) || 2));
+      currentStrokeWidth = numValue;
+      strokeWidthSlider.value = numValue;
+      strokeWidthInput.value = numValue;
+      strokeWidthValue.textContent = numValue;
+      applyCanvasSettings();
+    }
+
+    strokeWidthSlider.addEventListener('input', (e) => {
+      updateStrokeWidth(e.target.value);
+    });
+
+    strokeWidthInput.addEventListener('input', (e) => {
+      updateStrokeWidth(e.target.value);
+    });
+
+    strokeWidthInput.addEventListener('blur', (e) => {
+      updateStrokeWidth(e.target.value);
+    });
+
+    // Close settings panel when clicking outside
+    document.addEventListener('click', (e) => {
+      if (!settingsPanel.contains(e.target) && e.target !== settingsBtn) {
+        settingsPanel.classList.remove('open');
+      }
+    });
+
+    canvas.addEventListener('pointerdown', startDraw);
+    canvas.addEventListener('pointermove', moveDraw);
+    window.addEventListener('pointerup', endDraw);
+    canvas.addEventListener('touchstart', startDraw, { passive: false });
+    canvas.addEventListener('touchmove', moveDraw, { passive: false });
+    window.addEventListener('touchend', endDraw, { passive: false });
+
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+    initWebSocket();
+  </script>
+</body>
+</html>
+)rawliteral";
+
+template <typename T>
+T clampValue(T value, T minValue, T maxValue) {
+  if (value < minValue) {
+    return minValue;
+  }
+  if (value > maxValue) {
+    return maxValue;
+  }
+  return value;
+}
+
+int32_t roundToSteps(float value) {
+  return static_cast<int32_t>((value >= 0.0f) ? (value + 0.5f) : (value - 0.5f));
+}
+
+int32_t pixelsToStepsX(int32_t pixels) {
+  float base = pixels * STEPS_PER_PIXEL_X;
+  if (INVERT_X) {
+    base = -base;
+  }
+  int32_t steps = roundToSteps(base) + X_OFFSET_STEPS;
+  return clampValue<int32_t>(steps, X_MIN_STEPS, X_MAX_STEPS);
+}
+
+int32_t pixelsToStepsY(int32_t pixels) {
+  float base = pixels * STEPS_PER_PIXEL_Y;
+  if (INVERT_Y) {
+    base = -base;
+  }
+  int32_t steps = roundToSteps(base) + Y_OFFSET_STEPS;
+  return clampValue<int32_t>(steps, Y_MIN_STEPS, Y_MAX_STEPS);
+}
+
+void logCanvasOutput(int32_t xPixels, int32_t yPixels, bool penDown) {
+  if (enableLogCanvasOutput) {
+    Serial.printf("[CANVAS] x=%d y=%d pen=%s\n", xPixels, yPixels, penDown ? "DOWN" : "UP");
+  }
+}
+
+void logMotorCommands(int32_t xSteps, int32_t ySteps, bool penDown) {
+  if (enableLogMotorCommands) {
+    Serial.printf("[MOTOR] X1=%d X2=%d Y=%d pen=%s\n", 
+                  xSteps, 
+                  X2_OFFSET_STEPS + xSteps * X2_DIRECTION, 
+                  ySteps, 
+                  penDown ? "DOWN" : "UP");
+  }
+}
+
+void logGeneral(const char* message) {
+  if (enableLogGeneral) {
+    Serial.printf("[INFO] %s\n", message);
+  }
+}
+
+void queueTargetSteps(int32_t xSteps, int32_t ySteps, bool penDown) {
+  portENTER_CRITICAL(&targetMux);
+  queuedTargetX = xSteps;
+  queuedTargetY = ySteps;
+  queuedPenDown = penDown;
+  newTargetQueued = true;
+  portEXIT_CRITICAL(&targetMux);
+}
+
+void handleWebSocketMessage(void *arg, uint8_t *data, size_t len) {
+  AwsFrameInfo *info = static_cast<AwsFrameInfo *>(arg);
+  if (!(info->final && info->index == 0 && info->opcode == WS_TEXT)) {
+    return;
+  }
+
+  if (len >= 128) {
+    return;  // ignore overly long messages
+  }
+
+  data[len] = 0;
+  const char *payload = reinterpret_cast<char *>(data);
+
+  // Delegate to shared payload processor (works for WebSocket and Serial inputs)
+  // payload is null-terminated and within size limits
+  // Forward to the common processor below.
+  // Note: keep this lightweight — heavy work happens in the shared function.
+  // We'll implement processTextPayload(...) elsewhere in this file.
+  extern void processTextPayload(const char *payload);
+  processTextPayload(payload);
+}
+
+void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type,
+               void *arg, uint8_t *data, size_t len) {
+  switch (type) {
+    case WS_EVT_CONNECT: {
+      char msg[64];
+      snprintf(msg, sizeof(msg), "WebSocket client #%u connected", client->id());
+      logGeneral(msg);
+      break;
+    }
+    case WS_EVT_DISCONNECT: {
+      char msg[64];
+      snprintf(msg, sizeof(msg), "WebSocket client #%u disconnected", client->id());
+      logGeneral(msg);
+      break;
+    }
+    case WS_EVT_DATA:
+      handleWebSocketMessage(arg, data, len);
+      break;
+    case WS_EVT_PONG:
+    case WS_EVT_ERROR:
+      break;
+  }
+}
+
+// Shared processor for text payloads coming from WebSocket or Serial.
+// Accepts null-terminated payload strings (max ~127 chars).
+void processTextPayload(const char *payload) {
+  if (!payload) return;
+  size_t len = strlen(payload);
+  if (len == 0 || len >= 128) {
+    return;
+  }
+
+  // Check for command messages (start with "cmd:")
+  if (strncmp(payload, "cmd:", 4) == 0) {
+    const char *cmd = payload + 4;
+
+    // Status command: print system metadata and commands
+    if (strcmp(cmd, "status") == 0) {
+      // implemented below as logStatus()
+      extern void logStatus();
+      logStatus();
+      return;
+    }
+
+    if (strcmp(cmd, "disable_motors") == 0) {
+      motorsEnabled = false;
+      logGeneral("Motors disabled");
+      return;
+    } else if (strcmp(cmd, "enable_motors") == 0) {
+      motorsEnabled = true;
+      logGeneral("Motors enabled");
+      return;
+    } else if (strcmp(cmd, "disable_logs_canvas") == 0) {
+      enableLogCanvasOutput = false;
+      logGeneral("Canvas logging disabled");
+      return;
+    } else if (strcmp(cmd, "enable_logs_canvas") == 0) {
+      enableLogCanvasOutput = true;
+      logGeneral("Canvas logging enabled");
+      return;
+    } else if (strcmp(cmd, "disable_logs_motor") == 0) {
+      enableLogMotorCommands = false;
+      logGeneral("Motor command logging disabled");
+      return;
+    } else if (strcmp(cmd, "enable_logs_motor") == 0) {
+      enableLogMotorCommands = true;
+      logGeneral("Motor command logging enabled");
+      return;
+    } else if (strcmp(cmd, "disable_logs_general") == 0) {
+      enableLogGeneral = false;
+      Serial.println("[INFO] General logging disabled");
+      return;
+    } else if (strcmp(cmd, "enable_logs_general") == 0) {
+      enableLogGeneral = true;
+      Serial.println("[INFO] General logging enabled");
+      return;
+    } else if (strcmp(cmd, "disable_logs_all") == 0) {
+      enableLogCanvasOutput = false;
+      enableLogMotorCommands = false;
+      enableLogGeneral = false;
+      Serial.println("[INFO] All logging disabled");
+      return;
+    } else if (strcmp(cmd, "enable_logs_all") == 0) {
+      enableLogCanvasOutput = true;
+      enableLogMotorCommands = true;
+      enableLogGeneral = true;
+      Serial.println("[INFO] All logging enabled");
+      return;
+    }
+    // Unknown command, ignore
+    return;
+  }
+
+  // Parse drawing coordinates (format: "x&y-pen")
+  const char *amp = strchr(payload, '&');
+  const char *dash = strchr(payload, '-');
+  if (!amp || !dash || dash <= amp) {
+    return;
+  }
+
+  int32_t xPixels = atoi(payload);
+  int32_t yPixels = atoi(amp + 1);
+  int penValue = atoi(dash + 1);
+  bool penDown = penValue > 0;
+
+  // Log canvas output
+  logCanvasOutput(xPixels, yPixels, penDown);
+
+  int32_t xSteps = pixelsToStepsX(xPixels);
+  int32_t ySteps = pixelsToStepsY(yPixels);
+
+  // Log motor commands
+  logMotorCommands(xSteps, ySteps, penDown);
+
+  queueTargetSteps(xSteps, ySteps, penDown);
+}
+
+// Print a detailed status summary (metadata + available commands).
+void logStatus() {
+  Serial.println("=== PLOTTER STATUS ===");
+  // Network
+  Serial.printf("WiFi SSID: %s\n", ssid ? ssid : "(none)");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+
+  // Motor & motion
+  Serial.printf("Motors enabled: %s\n", motorsEnabled ? "YES" : "NO");
+  Serial.printf("Steps per pixel: X=%.2f Y=%.2f\n", STEPS_PER_PIXEL_X, STEPS_PER_PIXEL_Y);
+  Serial.printf("X offset: %ld, Y offset: %ld\n", (long)X_OFFSET_STEPS, (long)Y_OFFSET_STEPS);
+  Serial.printf("X range: [%ld, %ld], Y range: [%ld, %ld]\n",
+                (long)X_MIN_STEPS, (long)X_MAX_STEPS, (long)Y_MIN_STEPS, (long)Y_MAX_STEPS);
+  Serial.printf("Invert X: %s, Invert Y: %s\n", INVERT_X ? "YES" : "NO", INVERT_Y ? "YES" : "NO");
+  Serial.printf("Max speed (steps/s): %.2f, Accel (steps/s^2): %.2f\n", MAX_SPEED_STEPS_PER_SEC, ACCEL_STEPS_PER_SEC2);
+
+  // Secondary X
+  Serial.printf("X2 direction: %d, X2 offset: %ld\n", (int)X2_DIRECTION, (long)X2_OFFSET_STEPS);
+
+  // Servo
+  Serial.printf("Servo pin: %d, pen up angle: %d, pen down angle: %d\n", SERVO_PIN, PEN_UP_ANGLE, PEN_DOWN_ANGLE);
+
+  // Logging flags
+  Serial.printf("Logging - canvas: %s, motor: %s, general: %s\n",
+                enableLogCanvasOutput ? "ON" : "OFF",
+                enableLogMotorCommands ? "ON" : "OFF",
+                enableLogGeneral ? "ON" : "OFF");
+
+  // Available commands
+  Serial.println("Available serial/websocket commands:");
+  Serial.println("  cmd:status");
+  Serial.println("  cmd:disable_motors");
+  Serial.println("  cmd:enable_motors");
+  Serial.println("  cmd:disable_logs_canvas");
+  Serial.println("  cmd:enable_logs_canvas");
+  Serial.println("  cmd:disable_logs_motor");
+  Serial.println("  cmd:enable_logs_motor");
+  Serial.println("  cmd:disable_logs_general");
+  Serial.println("  cmd:enable_logs_general");
+  Serial.println("  cmd:disable_logs_all");
+  Serial.println("  cmd:enable_logs_all");
+  Serial.println("");
+}
+
+void initWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(ssid, password);
+  Serial.printf("Connecting to WiFi \"%s\" ", ssid);
+  unsigned long startAttempt = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print('.');
+    if (millis() - startAttempt > WIFI_CONNECT_TIMEOUT_MS) {
+      Serial.println("\nWiFi connection timeout, restarting...");
+      ESP.restart();
+    }
+  }
+  Serial.println("\nWiFi connected");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+void configureSteppers() {
+  stepperX1.setMaxSpeed(MAX_SPEED_STEPS_PER_SEC);
+  stepperX1.setAcceleration(ACCEL_STEPS_PER_SEC2);
+  stepperX2.setMaxSpeed(MAX_SPEED_STEPS_PER_SEC);
+  stepperX2.setAcceleration(ACCEL_STEPS_PER_SEC2);
+  stepperY.setMaxSpeed(MAX_SPEED_STEPS_PER_SEC);
+  stepperY.setAcceleration(ACCEL_STEPS_PER_SEC2);
+}
+
+void updatePen(bool penDown) {
+  // if (penDown == penCurrentlyDown) {
+  //   return;
+  // }
+  penCurrentlyDown = penDown;
+  const int targetAngle = penDown ? PEN_DOWN_ANGLE : PEN_UP_ANGLE;
+  Serial.printf("Updating pen: %s\n", penDown ? "DOWN" : "UP");
+  penServo.write(targetAngle);
+}
+
+int32_t absDiff(int32_t a, int32_t b) {
+  return (a > b) ? (a - b) : (b - a);
+}
+
+void applyQueuedTarget() {
+  bool hasTarget = false;
+  int32_t targetX = 0;
+  int32_t targetY = 0;
+  bool targetPen = false;
+
+  portENTER_CRITICAL(&targetMux);
+  if (newTargetQueued) {
+    hasTarget = true;
+    targetX = queuedTargetX;
+    targetY = queuedTargetY;
+    targetPen = queuedPenDown;
+    newTargetQueued = false;
+  }
+  portEXIT_CRITICAL(&targetMux);
+
+  if (!hasTarget) {
+    return;
+  }
+
+  if (!motorsEnabled) {
+    // Motors disabled - skip motor updates but still update pen if needed
+    // (or skip pen too if you prefer - uncomment the return to skip everything)
+    // return;
+    updatePen(targetPen);
+    return;
+  }
+
+  updatePen(targetPen);
+
+  const int32_t currentX = stepperX1.targetPosition();
+  const int32_t currentY = stepperY.targetPosition();
+  const bool needXMove = (absDiff(targetX, currentX) >= MIN_STEP_DELTA);
+  const bool needYMove = (absDiff(targetY, currentY) >= MIN_STEP_DELTA);
+
+  if (needXMove) {
+    stepperX1.moveTo(targetX);
+    int32_t x2Target = X2_OFFSET_STEPS + targetX * X2_DIRECTION;
+    x2Target = clampValue<int32_t>(x2Target, X2_MIN_STEPS, X2_MAX_STEPS);
+    stepperX2.moveTo(x2Target);
+  }
+
+  if (needYMove) {
+    stepperY.moveTo(targetY);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  penServo.attach(SERVO_PIN);
+  updatePen(false);
+  Serial.println("Servo initialized - starting test cycle");
+
+  // configureSteppers();
+  initWiFi();
+
+  ws.onEvent(onWsEvent);
+  server.addHandler(&ws);
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send_P(200, "text/html", index_html);
+  });
+
+  server.begin();
+  Serial.println("Web server started");
+  // Print initial status at startup
+  logStatus();
+}
+
+void loop() {
+  applyQueuedTarget();
+
+  // stepperX1.run();
+  // stepperX2.run();
+  // stepperY.run();
+
+  // Read serial lines and process them as commands or drawing payloads.
+  // Lines ending in '\n' or '\r' are considered complete.
+  static char serialLineBuf[128];
+  static size_t serialLineIdx = 0;
+  while (Serial.available() > 0) {
+    int c = Serial.read();
+    if (c == -1) break;
+    if (c == '\n' || c == '\r') {
+      if (serialLineIdx == 0) {
+        // ignore empty line
+        continue;
+      }
+      serialLineBuf[serialLineIdx] = 0;
+      processTextPayload(serialLineBuf);
+      serialLineIdx = 0;
+    } else {
+      if (serialLineIdx < (sizeof(serialLineBuf) - 1)) {
+        serialLineBuf[serialLineIdx++] = static_cast<char>(c);
+      } else {
+        // overflow - reset buffer
+        serialLineIdx = 0;
+      }
+    }
+  }
+
+  ws.cleanupClients();
+}
+
