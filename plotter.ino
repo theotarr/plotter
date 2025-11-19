@@ -249,11 +249,89 @@ const char index_html[] PROGMEM = R"rawliteral(
     let currentColor = '#2365ea';
     let currentStrokeWidth = 2;
     
+    let roundHistory = [];
+    let roundBaseHue = 0;
+    
     function applyCanvasSettings() {
       ctx.lineWidth = currentStrokeWidth;
       ctx.lineJoin = 'round';
       ctx.lineCap = 'round';
       ctx.strokeStyle = currentColor;
+    }
+
+    function drawPointsBatch(points, hue, alpha) {
+      if (!points || points.length < 2) return;
+      
+      ctx.lineWidth = currentStrokeWidth;
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      
+      if (hue === -1) {
+          ctx.strokeStyle = currentColor; 
+          ctx.beginPath();
+          let drawing = false;
+          for(let i=0; i<points.length; i++) {
+             const pt = points[i];
+             if (pt.pen === 1) {
+                 if (!drawing) {
+                    ctx.moveTo(pt.x, pt.y);
+                    drawing = true;
+                 } else {
+                    ctx.lineTo(pt.x, pt.y);
+                 }
+             } else {
+                 drawing = false;
+             }
+          }
+          ctx.stroke();
+      } else {
+          for(let i=1; i<points.length; i++) {
+             const p1 = points[i-1];
+             const p2 = points[i];
+             if (p1.pen === 0 || p2.pen === 0) continue;
+             
+             ctx.beginPath();
+             ctx.moveTo(p1.x, p1.y);
+             ctx.lineTo(p2.x, p2.y);
+             
+             const segHue = (hue + (i * 2)) % 360; 
+             ctx.strokeStyle = `hsla(${segHue}, 100%, 50%, ${alpha})`;
+             ctx.stroke();
+          }
+      }
+    }
+
+    function redrawCanvas() {
+      const w = canvas.width / currentDpr;
+      const h = canvas.height / currentDpr;
+      
+      ctx.setTransform(currentDpr, 0, 0, currentDpr, 0, 0);
+      ctx.fillStyle = '#111';
+      ctx.fillRect(0, 0, w, h);
+      
+      // Draw bounds
+      ctx.save();
+      ctx.strokeStyle = '#333';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(0, 0, w, h);
+      ctx.restore();
+
+      // Draw History
+      const totalRounds = roundHistory.length;
+      roundHistory.forEach((round, index) => {
+         const ageFactor = (index + 1) / (totalRounds + 1); 
+         const alpha = 0.2 + (0.6 * ageFactor); 
+         drawPointsBatch(round.points, round.hue, alpha);
+      });
+
+      // Draw Active Buffer
+      let activePoints = pointsBuffer;
+      if (gameMode && isReplaying) activePoints = nextRoundBuffer;
+      
+      if (activePoints.length > 0) {
+         const hue = gameMode ? roundBaseHue : -1;
+         drawPointsBatch(activePoints, hue, 1.0);
+      }
     }
 
     function resizeCanvas() {
@@ -267,11 +345,9 @@ const char index_html[] PROGMEM = R"rawliteral(
       
       let w, h;
       if (windowAspect > plotterAspect) {
-        // Window is wider -> limit by height
         h = windowH;
         w = h * plotterAspect;
       } else {
-        // Window is taller -> limit by width
         w = windowW;
         h = w / plotterAspect;
       }
@@ -285,18 +361,7 @@ const char index_html[] PROGMEM = R"rawliteral(
       canvas.width = Math.round(w * currentDpr);
       canvas.height = Math.round(h * currentDpr);
       
-      ctx.setTransform(currentDpr, 0, 0, currentDpr, 0, 0);
-      applyCanvasSettings();
-      
-      ctx.fillStyle = '#111';
-      ctx.fillRect(0, 0, w, h);
-      
-      // Draw bounds
-      ctx.save();
-      ctx.strokeStyle = '#333';
-      ctx.lineWidth = 2;
-      ctx.strokeRect(0, 0, w, h);
-      ctx.restore();
+      redrawCanvas();
     }
 
     function updateStatus(text, ok = false) {
@@ -361,10 +426,11 @@ const char index_html[] PROGMEM = R"rawliteral(
         gameState = 'IDLE';
         pointsBuffer = [];
         nextRoundBuffer = [];
+        roundHistory = [];
+        roundBaseHue = 0;
         isReplaying = false;
         updateGameUI();
-        // Clear canvas
-        clearBtn.click();
+        redrawCanvas();
     }
 
     function updateGameUI() {
@@ -392,29 +458,43 @@ const char index_html[] PROGMEM = R"rawliteral(
     }
 
     gameActionBtn.addEventListener('click', () => {
+        let sourcePoints = [];
+        
         if (gameState === 'IDLE') {
-            // User has drawn something manually. 
-            // Convert current pointsBuffer to the source for the robot
             if (pointsBuffer.length === 0) {
                 alert("Draw something first!");
                 return;
             }
-            startRobotRound(pointsBuffer);
+            sourcePoints = pointsBuffer;
         } else if (gameState === 'ROUND_DONE') {
-            // Use the buffer we captured during the last robot session
-            if (nextRoundBuffer.length === 0) {
+            if (nextRoundBuffer.length > 0) {
+                sourcePoints = nextRoundBuffer;
+            } else if (pointsBuffer.length > 0) {
+                sourcePoints = pointsBuffer;
+            }
+            
+            if (sourcePoints.length === 0) {
                 alert("No input detected from last round!");
                 return;
             }
-            // Clear screen for clean drawing
-            clearBtn.click();
-            
-            // Swap buffers: nextRoundBuffer becomes the source
-            const sourcePoints = [...nextRoundBuffer];
-            nextRoundBuffer = []; // Clear for new recording
-            
-            startRobotRound(sourcePoints);
         }
+        
+        // Archive current round
+        roundHistory.push({
+            points: sourcePoints,
+            hue: roundBaseHue
+        });
+        
+        // Rotate hue for next round
+        roundBaseHue = (roundBaseHue + 60) % 360;
+        
+        // Clear buffers
+        pointsBuffer = [];
+        nextRoundBuffer = [];
+        
+        redrawCanvas();
+        
+        startRobotRound(sourcePoints);
     });
 
     gameResetBtn.addEventListener('click', resetGame);
@@ -585,11 +665,12 @@ const char index_html[] PROGMEM = R"rawliteral(
       evt.preventDefault();
       drawing = true;
       lastPoint = getCanvasPoint(evt);
-      // Only draw visually if user is manually drawing, OR if we want to see the feedback line?
-      // Let's allow visual drawing always for feedback.
+      
+      // Prepare for drawing
       applyCanvasSettings();
       ctx.beginPath();
       ctx.moveTo(lastPoint.x, lastPoint.y);
+      
       recordPoint(lastPoint.x, lastPoint.y, 1);
     }
 
@@ -600,8 +681,22 @@ const char index_html[] PROGMEM = R"rawliteral(
       
       evt.preventDefault();
       const point = getCanvasPoint(evt);
+      
+      // Draw segment
+      ctx.beginPath();
+      ctx.moveTo(lastPoint.x, lastPoint.y);
       ctx.lineTo(point.x, point.y);
+      
+      if (gameMode) {
+          const i = (isReplaying ? nextRoundBuffer.length : pointsBuffer.length); 
+          const hue = (roundBaseHue + (i * 2)) % 360;
+          ctx.strokeStyle = `hsl(${hue}, 100%, 50%)`;
+      } else {
+          ctx.strokeStyle = currentColor;
+      }
+      
       ctx.stroke();
+      
       lastPoint = point;
       recordPoint(point.x, point.y, 1);
     }
@@ -617,21 +712,8 @@ const char index_html[] PROGMEM = R"rawliteral(
 
     clearBtn.addEventListener('click', () => {
       if (isSending) return;
-      
-      const w = canvas.width / currentDpr;
-      const h = canvas.height / currentDpr;
-
-      ctx.fillStyle = '#111';
-      ctx.fillRect(0, 0, w, h);
-      
-      ctx.save();
-      ctx.strokeStyle = '#333';
-      ctx.lineWidth = 2;
-      ctx.strokeRect(0, 0, w, h);
-      ctx.restore();
-
-      ctx.beginPath();
       pointsBuffer = [];
+      redrawCanvas();
     });
     
     submitBtn.addEventListener('click', submitDrawing);
@@ -1294,12 +1376,28 @@ void measureAxisLength(AccelStepper &stepper, ezButton &limitSwitch,
 
 void setup() {
   Serial.begin(115200);
+
+  // Initialize WiFi
+  initWiFi();
+
+  // Initialize WebSocket
+  ws.onEvent(onWsEvent);
+  server.addHandler(&ws);
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send_P(200, "text/html", index_html);
+  });
+  server.begin();
+  Serial.println("Web server started");
+
+  // Initialize servo
   penServo.attach(SERVO_PIN);
   updatePen(false);
-  Serial.println("Servo initialized - starting test cycle");
 
+
+  // Initialize steppers
   configureSteppers();
 
+  // Initialize limit switches
   limitSwitchX.setDebounceTime(50);
   limitSwitchY.setDebounceTime(50);
 
@@ -1311,22 +1409,9 @@ void setup() {
   homeAxis(stepperY, limitSwitchY, -1);
   Serial.println("Y axis homed");
 
-  // // Calibrate axes (measures total steps)
-  // measureAxisLength(stepperX, limitSwitchX, 1, "X");
-  // measureAxisLength(stepperY, limitSwitchY, 1, "Y");
 
-  initWiFi();
 
-  ws.onEvent(onWsEvent);
-  server.addHandler(&ws);
 
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send_P(200, "text/html", index_html);
-  });
-
-  server.begin();
-  Serial.println("Web server started");
-  // Print initial status at startup
   logStatus();
 }
 
