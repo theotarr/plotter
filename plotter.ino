@@ -1,11 +1,11 @@
-#include <Arduino.h>
-#include <WiFi.h>
-#include <AsyncTCP.h>
-#include <ESPAsyncWebServer.h>
 #include <AccelStepper.h>
+#include <Arduino.h>
+#include <AsyncTCP.h>
 #include <ESP32Servo.h>
-#include <ezButton.h>
+#include <ESPAsyncWebServer.h>
+#include <WiFi.h>
 #include <cstring>
+#include <ezButton.h>
 
 // Makerspace Wifi Credentials
 const char *ssid = "MAKERSPACE";
@@ -20,7 +20,6 @@ constexpr int Y_DIR_PIN = 26;
 constexpr int X_LIMIT_PIN = 23;
 constexpr int Y_LIMIT_PIN = 22;
 
-
 // Servo configuration
 constexpr int SERVO_PIN = 27;
 constexpr int PEN_UP_ANGLE = 90;
@@ -31,18 +30,16 @@ constexpr float STEPS_PER_PIXEL_X = 1.0f;
 constexpr float STEPS_PER_PIXEL_Y = 1.0f;
 constexpr int32_t X_OFFSET_STEPS = 0;
 constexpr int32_t Y_OFFSET_STEPS = 0;
-constexpr bool INVERT_X = true;
-constexpr bool INVERT_Y = true;
 constexpr int32_t X_MIN_STEPS = 0;
 constexpr int32_t X_MAX_STEPS = 1200;
 constexpr int32_t Y_MIN_STEPS = 0;
 constexpr int32_t Y_MAX_STEPS = 450;
 
-
 // Motion dynamics
-constexpr float MAX_SPEED_STEPS_PER_SEC = 300.0f;
-constexpr float ACCEL_STEPS_PER_SEC2 = 150.0f;
-constexpr int32_t MIN_STEP_DELTA = 2;
+constexpr float MAX_SPEED_STEPS_PER_SEC = 500.0f;
+constexpr float ACCEL_STEPS_PER_SEC2 = 250.0f;
+constexpr int32_t MIN_STEP_DELTA = 1;
+constexpr int32_t LIMIT_SWITCH_BUFFER_STEPS = 20;
 
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
@@ -150,7 +147,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     let ackResolver = null;
     
     let currentDpr = 1;
-    let currentColor = 'rgb(35, 101, 234)';
+    let currentColor = '#2365ea';
     let currentStrokeWidth = 2;
 
     // Plotter physical limits (in steps)
@@ -166,16 +163,45 @@ const char index_html[] PROGMEM = R"rawliteral(
 
     function resizeCanvas() {
       currentDpr = Math.max(1, window.devicePixelRatio || 1);
-      const width = window.innerWidth;
-      const height = window.innerHeight;
-      canvas.style.width = width + 'px';
-      canvas.style.height = height + 'px';
-      canvas.width = Math.round(width * currentDpr);
-      canvas.height = Math.round(height * currentDpr);
+      
+      const windowW = window.innerWidth;
+      const windowH = window.innerHeight;
+      
+      const plotterAspect = PLOTTER_MAX_X / PLOTTER_MAX_Y;
+      const windowAspect = windowW / windowH;
+      
+      let w, h;
+      if (windowAspect > plotterAspect) {
+        // Window is wider -> limit by height
+        h = windowH;
+        w = h * plotterAspect;
+      } else {
+        // Window is taller -> limit by width
+        w = windowW;
+        h = w / plotterAspect;
+      }
+
+      canvas.style.width = w + 'px';
+      canvas.style.height = h + 'px';
+      canvas.style.position = 'absolute';
+      canvas.style.left = (windowW - w) / 2 + 'px';
+      canvas.style.top = (windowH - h) / 2 + 'px';
+
+      canvas.width = Math.round(w * currentDpr);
+      canvas.height = Math.round(h * currentDpr);
+      
       ctx.setTransform(currentDpr, 0, 0, currentDpr, 0, 0);
       applyCanvasSettings();
+      
       ctx.fillStyle = '#111';
-      ctx.fillRect(0, 0, width, height);
+      ctx.fillRect(0, 0, w, h);
+      
+      // Draw bounds
+      ctx.save();
+      ctx.strokeStyle = '#333';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(0, 0, w, h);
+      ctx.restore();
     }
 
     function updateStatus(text, ok = false) {
@@ -312,12 +338,19 @@ const char index_html[] PROGMEM = R"rawliteral(
 
     clearBtn.addEventListener('click', () => {
       if (isSending) return;
-      ctx.save();
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.restore();
+      
+      const w = canvas.width / currentDpr;
+      const h = canvas.height / currentDpr;
+
       ctx.fillStyle = '#111';
-      ctx.fillRect(0, 0, canvas.width / currentDpr, canvas.height / currentDpr);
+      ctx.fillRect(0, 0, w, h);
+      
+      ctx.save();
+      ctx.strokeStyle = '#333';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(0, 0, w, h);
+      ctx.restore();
+
       ctx.beginPath();
       pointsBuffer = [];
     });
@@ -376,8 +409,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
-template <typename T>
-T clampValue(T value, T minValue, T maxValue) {
+template <typename T> T clampValue(T value, T minValue, T maxValue) {
   if (value < minValue) {
     return minValue;
   }
@@ -388,17 +420,19 @@ T clampValue(T value, T minValue, T maxValue) {
 }
 
 int32_t roundToSteps(float value) {
-  return static_cast<int32_t>((value >= 0.0f) ? (value + 0.5f) : (value - 0.5f));
+  return static_cast<int32_t>((value >= 0.0f) ? (value + 0.5f)
+                                              : (value - 0.5f));
 }
-
 
 int32_t pixelsToStepsX(int32_t pixels) {
   float base = pixels * STEPS_PER_PIXEL_X;
   int32_t steps = roundToSteps(base) + X_OFFSET_STEPS;
   if (steps < X_MIN_STEPS) {
-    Serial.printf("[BOUNDS] X steps %ld exceeds minimum %ld (clamped)\n", (long)steps, (long)X_MIN_STEPS);
+    Serial.printf("[BOUNDS] X steps %ld exceeds minimum %ld (clamped)\n",
+                  (long)steps, (long)X_MIN_STEPS);
   } else if (steps > X_MAX_STEPS) {
-    Serial.printf("[BOUNDS] X steps %ld exceeds maximum %ld (clamped)\n", (long)steps, (long)X_MAX_STEPS);
+    Serial.printf("[BOUNDS] X steps %ld exceeds maximum %ld (clamped)\n",
+                  (long)steps, (long)X_MAX_STEPS);
   }
   return clampValue<int32_t>(steps, X_MIN_STEPS, X_MAX_STEPS);
 }
@@ -407,29 +441,30 @@ int32_t pixelsToStepsY(int32_t pixels) {
   float base = pixels * STEPS_PER_PIXEL_Y;
   int32_t steps = roundToSteps(base) + Y_OFFSET_STEPS;
   if (steps < Y_MIN_STEPS) {
-    Serial.printf("[BOUNDS] Y steps %ld exceeds minimum %ld (clamped)\n", (long)steps, (long)Y_MIN_STEPS);
+    Serial.printf("[BOUNDS] Y steps %ld exceeds minimum %ld (clamped)\n",
+                  (long)steps, (long)Y_MIN_STEPS);
   } else if (steps > Y_MAX_STEPS) {
-    Serial.printf("[BOUNDS] Y steps %ld exceeds maximum %ld (clamped)\n", (long)steps, (long)Y_MAX_STEPS);
+    Serial.printf("[BOUNDS] Y steps %ld exceeds maximum %ld (clamped)\n",
+                  (long)steps, (long)Y_MAX_STEPS);
   }
   return clampValue<int32_t>(steps, Y_MIN_STEPS, Y_MAX_STEPS);
 }
 
 void logCanvasOutput(int32_t xPixels, int32_t yPixels, bool penDown) {
   if (enableLogCanvasOutput) {
-    Serial.printf("[CANVAS] x=%d y=%d pen=%s\n", xPixels, yPixels, penDown ? "DOWN" : "UP");
+    Serial.printf("[CANVAS] x=%d y=%d pen=%s\n", xPixels, yPixels,
+                  penDown ? "DOWN" : "UP");
   }
 }
 
 void logMotorCommands(int32_t xSteps, int32_t ySteps, bool penDown) {
   if (enableLogMotorCommands) {
-    Serial.printf("[MOTOR] X=%d Y=%d pen=%s\n", 
-                  xSteps, 
-                  ySteps, 
+    Serial.printf("[MOTOR] X=%d Y=%d pen=%s\n", xSteps, ySteps,
                   penDown ? "DOWN" : "UP");
   }
 }
 
-void logGeneral(const char* message) {
+void logGeneral(const char *message) {
   if (enableLogGeneral) {
     Serial.printf("[INFO] %s\n", message);
   }
@@ -448,24 +483,25 @@ bool queueTargetSteps(int32_t xSteps, int32_t ySteps, bool penDown) {
   return success;
 }
 
-void handleWebSocketMessage(AsyncWebSocketClient *client, void *arg, uint8_t *data, size_t len) {
+void handleWebSocketMessage(AsyncWebSocketClient *client, void *arg,
+                            uint8_t *data, size_t len) {
   AwsFrameInfo *info = static_cast<AwsFrameInfo *>(arg);
   if (!(info->final && info->index == 0 && info->opcode == WS_TEXT)) {
     return;
   }
 
   if (len >= 128) {
-    return;  // ignore overly long messages
+    return; // ignore overly long messages
   }
 
   data[len] = 0;
   const char *payload = reinterpret_cast<char *>(data);
 
-  // Delegate to shared payload processor (works for WebSocket and Serial inputs)
-  // payload is null-terminated and within size limits
-  // Forward to the common processor below.
-  // Note: keep this lightweight — heavy work happens in the shared function.
-  // We'll implement processTextPayload(...) elsewhere in this file.
+  // Delegate to shared payload processor (works for WebSocket and Serial
+  // inputs) payload is null-terminated and within size limits Forward to the
+  // common processor below. Note: keep this lightweight — heavy work happens in
+  // the shared function. We'll implement processTextPayload(...) elsewhere in
+  // this file.
   extern bool processTextPayload(const char *payload);
   if (processTextPayload(payload)) {
     // Send ACK for flow control (only if processed/enqueued)
@@ -473,34 +509,36 @@ void handleWebSocketMessage(AsyncWebSocketClient *client, void *arg, uint8_t *da
   }
 }
 
-void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type,
-               void *arg, uint8_t *data, size_t len) {
+void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
+               AwsEventType type, void *arg, uint8_t *data, size_t len) {
   switch (type) {
-    case WS_EVT_CONNECT: {
-      char msg[64];
-      snprintf(msg, sizeof(msg), "WebSocket client #%u connected", client->id());
-      logGeneral(msg);
-      break;
-    }
-    case WS_EVT_DISCONNECT: {
-      char msg[64];
-      snprintf(msg, sizeof(msg), "WebSocket client #%u disconnected", client->id());
-      logGeneral(msg);
-      break;
-    }
-    case WS_EVT_DATA:
-      handleWebSocketMessage(client, arg, data, len);
-      break;
-    case WS_EVT_PONG:
-    case WS_EVT_ERROR:
-      break;
+  case WS_EVT_CONNECT: {
+    char msg[64];
+    snprintf(msg, sizeof(msg), "WebSocket client #%u connected", client->id());
+    logGeneral(msg);
+    break;
+  }
+  case WS_EVT_DISCONNECT: {
+    char msg[64];
+    snprintf(msg, sizeof(msg), "WebSocket client #%u disconnected",
+             client->id());
+    logGeneral(msg);
+    break;
+  }
+  case WS_EVT_DATA:
+    handleWebSocketMessage(client, arg, data, len);
+    break;
+  case WS_EVT_PONG:
+  case WS_EVT_ERROR:
+    break;
   }
 }
 
 // Shared processor for text payloads coming from WebSocket or Serial.
 // Accepts null-terminated payload strings (max ~127 chars).
 bool processTextPayload(const char *payload) {
-  if (!payload) return false;
+  if (!payload)
+    return false;
   size_t len = strlen(payload);
   if (len == 0 || len >= 128) {
     return false;
@@ -606,15 +644,18 @@ void logStatus() {
 
   // Motor & motion
   Serial.printf("Motors enabled: %s\n", motorsEnabled ? "YES" : "NO");
-  Serial.printf("Steps per pixel: X=%.2f Y=%.2f\n", STEPS_PER_PIXEL_X, STEPS_PER_PIXEL_Y);
-  Serial.printf("X offset: %ld, Y offset: %ld\n", (long)X_OFFSET_STEPS, (long)Y_OFFSET_STEPS);
-  Serial.printf("X range: [%ld, %ld], Y range: [%ld, %ld]\n",
-                (long)X_MIN_STEPS, (long)X_MAX_STEPS, (long)Y_MIN_STEPS, (long)Y_MAX_STEPS);
-  Serial.printf("Invert X: %s, Invert Y: %s\n", INVERT_X ? "YES" : "NO", INVERT_Y ? "YES" : "NO");
-  Serial.printf("Max speed (steps/s): %.2f, Accel (steps/s^2): %.2f\n", MAX_SPEED_STEPS_PER_SEC, ACCEL_STEPS_PER_SEC2);
+  Serial.printf("Steps per pixel: X=%.2f Y=%.2f\n", STEPS_PER_PIXEL_X,
+                STEPS_PER_PIXEL_Y);
+  Serial.printf("X offset: %ld, Y offset: %ld\n", (long)X_OFFSET_STEPS,
+                (long)Y_OFFSET_STEPS);
+  Serial.printf("X range: [%ld, %ld], Y range: [%ld, %ld]\n", (long)X_MIN_STEPS,
+                (long)X_MAX_STEPS, (long)Y_MIN_STEPS, (long)Y_MAX_STEPS);
+  Serial.printf("Max speed (steps/s): %.2f, Accel (steps/s^2): %.2f\n",
+                MAX_SPEED_STEPS_PER_SEC, ACCEL_STEPS_PER_SEC2);
 
   // Servo
-  Serial.printf("Servo pin: %d, pen up angle: %d, pen down angle: %d\n", SERVO_PIN, PEN_UP_ANGLE, PEN_DOWN_ANGLE);
+  Serial.printf("Servo pin: %d, pen up angle: %d, pen down angle: %d\n",
+                SERVO_PIN, PEN_UP_ANGLE, PEN_DOWN_ANGLE);
 
   // Logging flags
   Serial.printf("Logging - canvas: %s, motor: %s, general: %s\n",
@@ -670,9 +711,7 @@ void updatePen(bool penDown) {
   penServo.write(targetAngle);
 }
 
-int32_t absDiff(int32_t a, int32_t b) {
-  return (a > b) ? (a - b) : (b - a);
-}
+int32_t absDiff(int32_t a, int32_t b) { return (a > b) ? (a - b) : (b - a); }
 
 void applyQueuedTarget() {
   if (stepperX.distanceToGo() != 0 || stepperY.distanceToGo() != 0) {
@@ -698,31 +737,21 @@ void applyQueuedTarget() {
   int32_t targetY = cmd.ySteps;
   bool targetPen = cmd.penDown;
 
-  if (!motorsEnabled) {
-    // Motors disabled - skip motor updates but still update pen if needed
-    // (or skip pen too if you prefer - uncomment the return to skip everything)
-    // return;
-    updatePen(targetPen);
-    return;
-  }
-
   updatePen(targetPen);
 
   const int32_t currentX = stepperX.targetPosition();
   const int32_t currentY = stepperY.targetPosition();
+
   const bool needXMove = (absDiff(targetX, currentX) >= MIN_STEP_DELTA);
   const bool needYMove = (absDiff(targetY, currentY) >= MIN_STEP_DELTA);
 
-  if (needXMove) {
+  if (needXMove && motorsEnabled)
     stepperX.moveTo(targetX);
-  }
-
-  if (needYMove) {
+  if (needYMove && motorsEnabled)
     stepperY.moveTo(targetY);
-  }
 }
 
-void homeAxis(AccelStepper& stepper, ezButton& limitSwitch, int direction) {
+void homeAxis(AccelStepper &stepper, ezButton &limitSwitch, int direction) {
   float originalMaxSpeed = stepper.maxSpeed();
   stepper.setMaxSpeed(100.0); // Slow speed for homing
 
@@ -733,7 +762,6 @@ void homeAxis(AccelStepper& stepper, ezButton& limitSwitch, int direction) {
     limitSwitch.loop();
     if (limitSwitch.getState() == LOW) { // Touched
       stepper.stop();
-      stepper.setCurrentPosition(0);
       break;
     }
     stepper.run();
@@ -741,14 +769,25 @@ void homeAxis(AccelStepper& stepper, ezButton& limitSwitch, int direction) {
       break;
     }
   }
-  
+
+  // Back off from the limit switch
+  stepper.setCurrentPosition(0); // Temporarily set 0 at switch
+  stepper.move(-direction * LIMIT_SWITCH_BUFFER_STEPS); // Move away
+  while (stepper.distanceToGo() != 0) {
+    stepper.run();
+  }
+
+  // Set the new 0 position (home)
+  stepper.setCurrentPosition(0);
+
   stepper.setMaxSpeed(originalMaxSpeed);
   stepper.moveTo(0);
 }
 
-void measureAxisLength(AccelStepper& stepper, ezButton& limitSwitch, int homeDir, const char* axisName) {
+void measureAxisLength(AccelStepper &stepper, ezButton &limitSwitch,
+                       int homeDir, const char *axisName) {
   Serial.printf("Measuring %s axis length...\n", axisName);
-  
+
   // 1. Home to the starting bound
   homeAxis(stepper, limitSwitch, homeDir);
   delay(500);
@@ -761,7 +800,7 @@ void measureAxisLength(AccelStepper& stepper, ezButton& limitSwitch, int homeDir
     stepper.run();
     limitSwitch.loop(); // Keep button updated
   }
-  
+
   if (limitSwitch.getState() == LOW) {
     Serial.println("Warning: Switch still triggered after backoff!");
   }
@@ -770,19 +809,19 @@ void measureAxisLength(AccelStepper& stepper, ezButton& limitSwitch, int homeDir
   Serial.println("Moving to opposite bound...");
   float originalMaxSpeed = stepper.maxSpeed();
   stepper.setMaxSpeed(200.0); // Slower for accuracy
-  
+
   // Move effectively forever in opposite direction
-  stepper.moveTo(-homeDir * 1000000); 
+  stepper.moveTo(-homeDir * 1000000);
 
   while (true) {
     stepper.run();
-    
-    // Print position every 10 steps to avoid flooding serial too much, 
+
+    // Print position every 10 steps to avoid flooding serial too much,
     // but frequently enough to capture the last position.
     if (abs(stepper.currentPosition()) % 10 == 0) {
-        Serial.printf("Current Position: %ld\n", stepper.currentPosition());
+      Serial.printf("Current Position: %ld\n", stepper.currentPosition());
     }
-    
+
     if (stepper.distanceToGo() == 0) {
       Serial.println("Error: Reached max travel limit (virtual)");
       break;
@@ -808,7 +847,7 @@ void setup() {
   Serial.println("Servo initialized - starting test cycle");
 
   configureSteppers();
-  
+
   limitSwitchX.setDebounceTime(50);
   limitSwitchY.setDebounceTime(50);
 
@@ -840,20 +879,33 @@ void setup() {
 }
 
 void loop() {
+  limitSwitchX.loop();
+  limitSwitchY.loop();
+
   applyQueuedTarget();
+
+  // Safety: Stop if hitting limit switches (Active)
+  // Homing uses direction 1, implying switches are at the positive limit.
+  // If switch pressed, prevent positive movement (distanceToGo > 0).
+  if (limitSwitchX.isPressed() && stepperX.distanceToGo() > 0) {
+    Serial.println("X limit switch pressed, stopping");
+    stepperX.moveTo(stepperX.currentPosition());
+  }
+  if (limitSwitchY.isPressed() && stepperY.distanceToGo() > 0) {
+    Serial.println("Y limit switch pressed, stopping");
+    stepperY.moveTo(stepperY.currentPosition());
+  }
 
   stepperX.run();
   stepperY.run();
-
-  limitSwitchX.loop();
-  limitSwitchY.loop();
   // Read serial lines and process them as commands or drawing payloads.
   // Lines ending in '\n' or '\r' are considered complete.
   static char serialLineBuf[128];
   static size_t serialLineIdx = 0;
   while (Serial.available() > 0) {
     int c = Serial.read();
-    if (c == -1) break;
+    if (c == -1)
+      break;
     if (c == '\n' || c == '\r') {
       if (serialLineIdx == 0) {
         // ignore empty line
