@@ -101,6 +101,11 @@ const char index_html[] PROGMEM = R"rawliteral(
     #strokeWidthSlider::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 16px; height: 16px; background: #ff5252; border-radius: 50%; cursor: pointer; }
     #strokeWidthSlider::-moz-range-thumb { width: 16px; height: 16px; background: #ff5252; border-radius: 50%; cursor: pointer; border: none; }
     #strokeWidthValue { min-width: 40px; text-align: right; font-size: 13px; opacity: 0.8; }
+    .control-pad { display: flex; flex-direction: column; align-items: center; gap: 4px; margin-top: 10px; }
+    .control-pad div { display: flex; gap: 4px; }
+    .control-pad button { width: 40px; height: 40px; padding: 0; display: flex; align-items: center; justify-content: center; font-size: 20px; background: #2a2a2a; }
+    .control-pad button:active { background: #ff5252; border-color: #ff5252; }
+    .instruction { text-align: center; font-size: 12px; opacity: 0.6; margin-top: 8px; }
   </style>
 </head>
 <body>
@@ -123,6 +128,25 @@ const char index_html[] PROGMEM = R"rawliteral(
       </div>
       <input type="number" id="strokeWidthInput" min="1" max="50" value="2" step="1">
     </div>
+    <div class="settings-group">
+      <label class="settings-label">Manual Control</label>
+      <div class="control-pad">
+        <button id="jogYMinus">▲</button>
+        <div>
+          <button id="jogXMinus">◀</button>
+          <button id="jogXPlus">▶</button>
+        </div>
+        <button id="jogYPlus">▼</button>
+      </div>
+      <div class="instruction">Use Arrow Keys</div>
+      <label class="settings-label" style="margin-top: 10px;">Jog Steps</label>
+      <select id="jogStepSize" style="width: 100%; height: 30px; background: #1f1f1f; border: 1px solid #444; color: inherit; border-radius: 4px;">
+          <option value="1">1 Step</option>
+          <option value="10">10 Steps</option>
+          <option value="50">50 Steps</option>
+          <option value="100">100 Steps</option>
+      </select>
+    </div>
   </div>
   <canvas id="canvas"></canvas>
   <script>
@@ -137,6 +161,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     const strokeWidthSlider = document.getElementById('strokeWidthSlider');
     const strokeWidthInput = document.getElementById('strokeWidthInput');
     const strokeWidthValue = document.getElementById('strokeWidthValue');
+    const jogStepSelect = document.getElementById('jogStepSize');
     const gateway = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`;
     
     let websocket;
@@ -257,10 +282,11 @@ const char index_html[] PROGMEM = R"rawliteral(
       
       // Simple linear mapping:
       // x_steps = (pt.x / canvas_width) * PLOTTER_MAX_X
-      // y_steps = (pt.y / canvas_height) * PLOTTER_MAX_Y
+      // y_steps = ((h - pt.y) / canvas_height) * PLOTTER_MAX_Y  <-- Inverted Y for bottom-left origin
       
       const targetX = Math.round((pt.x / w) * PLOTTER_MAX_X);
-      const targetY = Math.round((pt.y / h) * PLOTTER_MAX_Y);
+      // Invert Y: Canvas (0 at top) -> Plotter (Max at top)
+      const targetY = Math.round(((h - pt.y) / h) * PLOTTER_MAX_Y);
 
       websocket.send(`${targetX}&${targetY}-${pt.pen}`);
     }
@@ -403,6 +429,34 @@ const char index_html[] PROGMEM = R"rawliteral(
 
     window.addEventListener('resize', resizeCanvas);
     resizeCanvas();
+    function getJogStep() {
+      return parseInt(jogStepSelect.value) || 1;
+    }
+
+    function sendJog(dx, dy) {
+      if (!websocket || websocket.readyState !== WebSocket.OPEN) return;
+      const step = getJogStep();
+      websocket.send(`cmd:jog:${dx * step},${dy * step}`);
+    }
+
+    document.getElementById('jogYMinus').addEventListener('click', () => sendJog(0, 1));
+    document.getElementById('jogYPlus').addEventListener('click', () => sendJog(0, -1));
+    document.getElementById('jogXMinus').addEventListener('click', () => sendJog(-1, 0));
+    document.getElementById('jogXPlus').addEventListener('click', () => sendJog(1, 0));
+
+    window.addEventListener('keydown', (e) => {
+      if (!settingsPanel.classList.contains('open')) return;
+
+      switch(e.key) {
+        case 'ArrowUp': sendJog(0, 1); break;
+        case 'ArrowDown': sendJog(0, -1); break;
+        case 'ArrowLeft': sendJog(-1, 0); break;
+        case 'ArrowRight': sendJog(1, 0); break;
+        default: return;
+      }
+      e.preventDefault();
+    });
+
     initWebSocket();
   </script>
 </body>
@@ -600,6 +654,23 @@ bool processTextPayload(const char *payload) {
       enableLogGeneral = true;
       Serial.println("[INFO] All logging enabled");
       return true;
+    } else if (strncmp(cmd, "jog:", 4) == 0) {
+      const char *args = cmd + 4;
+      const char *comma = strchr(args, ',');
+      if (comma) {
+        int dx = atoi(args);
+        int dy = atoi(comma + 1);
+
+        int32_t targetX = stepperX.targetPosition() + dx;
+        int32_t targetY = stepperY.targetPosition() + dy;
+
+        // Clamp to bounds
+        targetX = clampValue<int32_t>(targetX, X_MIN_STEPS, X_MAX_STEPS);
+        targetY = clampValue<int32_t>(targetY, Y_MIN_STEPS, Y_MAX_STEPS);
+
+        queueTargetSteps(targetX, targetY, penCurrentlyDown);
+      }
+      return true;
     }
     // Unknown command, ignore
     return false;
@@ -699,6 +770,11 @@ void initWiFi() {
 }
 
 void configureSteppers() {
+  // Invert X axis direction to match physical setup (Positive moves away from switch)
+  stepperX.setPinsInverted(true, false, false);
+  // Invert Y axis direction so Positive moves UP (away from switch at bottom)
+  stepperY.setPinsInverted(true, false, false);
+
   // Speed and acceleration are in steps per second
   stepperX.setMaxSpeed(MAX_SPEED_STEPS_PER_SEC);
   stepperX.setAcceleration(ACCEL_STEPS_PER_SEC2);
@@ -709,6 +785,7 @@ void configureSteppers() {
 void updatePen(bool penDown) {
   const int targetAngle = penDown ? PEN_DOWN_ANGLE : PEN_UP_ANGLE;
   penServo.write(targetAngle);
+  penCurrentlyDown = penDown;
 }
 
 int32_t absDiff(int32_t a, int32_t b) { return (a > b) ? (a - b) : (b - a); }
@@ -852,11 +929,11 @@ void setup() {
   limitSwitchY.setDebounceTime(50);
 
   Serial.println("Homing X axis...");
-  homeAxis(stepperX, limitSwitchX, 1);
+  homeAxis(stepperX, limitSwitchX, -1);
   Serial.println("X axis homed");
 
   Serial.println("Homing Y axis...");
-  homeAxis(stepperY, limitSwitchY, 1);
+  homeAxis(stepperY, limitSwitchY, -1);
   Serial.println("Y axis homed");
 
   // // Calibrate axes (measures total steps)
@@ -885,13 +962,13 @@ void loop() {
   applyQueuedTarget();
 
   // Safety: Stop if hitting limit switches (Active)
-  // Homing uses direction 1, implying switches are at the positive limit.
-  // If switch pressed, prevent positive movement (distanceToGo > 0).
-  if (limitSwitchX.isPressed() && stepperX.distanceToGo() > 0) {
+  // Homing uses direction -1 for X, implying switches are at the negative limit (0).
+  // If switch pressed, prevent negative movement (distanceToGo < 0).
+  if (limitSwitchX.isPressed() && stepperX.distanceToGo() < 0) {
     Serial.println("X limit switch pressed, stopping");
     stepperX.moveTo(stepperX.currentPosition());
   }
-  if (limitSwitchY.isPressed() && stepperY.distanceToGo() > 0) {
+  if (limitSwitchY.isPressed() && stepperY.distanceToGo() < 0) {
     Serial.println("Y limit switch pressed, stopping");
     stepperY.moveTo(stepperY.currentPosition());
   }
