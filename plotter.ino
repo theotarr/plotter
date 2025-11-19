@@ -6,28 +6,26 @@
 #include <ESP32Servo.h>
 #include <cstring>
 
+
+// Makerspace Wifi Credentials
+constexpr char *ssid = "MAKERSPACE";
+constexpr char *password = "12345678";
 constexpr int WIFI_CONNECT_TIMEOUT_MS = 20000;
 
-// Replace with your network credentials
-const char *ssid = "MAKERSPACE";
-const char *password = "12345678";
-
-// Stepper pin assignments
-constexpr int X1_STEP_PIN = 2;
-constexpr int X1_DIR_PIN = 4;
-constexpr int X2_STEP_PIN = 5;
-constexpr int X2_DIR_PIN = 18;
-constexpr int Y_STEP_PIN = 19;
-constexpr int Y_DIR_PIN = 21;
+// Stepper pins
+constexpr int X_STEP_PIN = 32;
+constexpr int X_DIR_PIN = 33;
+constexpr int Y_STEP_PIN = 25;
+constexpr int Y_DIR_PIN = 26;
 
 // Servo configuration
 constexpr int SERVO_PIN = 27;
-constexpr int PEN_UP_ANGLE = 20;
+constexpr int PEN_UP_ANGLE = 45;
 constexpr int PEN_DOWN_ANGLE = 90;
 
 // Motion calibration (tune for your machine)
-constexpr float STEPS_PER_PIXEL_X = 10.0f;
-constexpr float STEPS_PER_PIXEL_Y = 10.0f;
+constexpr float STEPS_PER_PIXEL_X = 1.0f;
+constexpr float STEPS_PER_PIXEL_Y = 1.0f;
 constexpr int32_t X_OFFSET_STEPS = 0;
 constexpr int32_t Y_OFFSET_STEPS = 0;
 constexpr bool INVERT_X = false;
@@ -37,22 +35,15 @@ constexpr int32_t X_MAX_STEPS = 20000;
 constexpr int32_t Y_MIN_STEPS = 0;
 constexpr int32_t Y_MAX_STEPS = 15000;
 
-// Secondary X motor (belt duplication) settings
-constexpr int8_t X2_DIRECTION = 1;   // set -1 if X2 needs to run opposite
-constexpr int32_t X2_OFFSET_STEPS = 0;
-constexpr int32_t X2_MIN_STEPS = X_MIN_STEPS;
-constexpr int32_t X2_MAX_STEPS = X_MAX_STEPS;
-
 // Motion dynamics
-constexpr float MAX_SPEED_STEPS_PER_SEC = 1200.0f;
-constexpr float ACCEL_STEPS_PER_SEC2 = 800.0f;
+constexpr float MAX_SPEED_STEPS_PER_SEC = 300.0f;
+constexpr float ACCEL_STEPS_PER_SEC2 = 150.0f;
 constexpr int32_t MIN_STEP_DELTA = 2;
 
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 
-AccelStepper stepperX1(AccelStepper::DRIVER, X1_STEP_PIN, X1_DIR_PIN);
-AccelStepper stepperX2(AccelStepper::DRIVER, X2_STEP_PIN, X2_DIR_PIN);
+AccelStepper stepperX(AccelStepper::DRIVER, X_STEP_PIN, X_DIR_PIN);
 AccelStepper stepperY(AccelStepper::DRIVER, Y_STEP_PIN, Y_DIR_PIN);
 
 Servo penServo;
@@ -65,7 +56,7 @@ volatile int32_t queuedTargetY = 0;
 volatile bool queuedPenDown = false;
 
 // Control flags
-bool motorsEnabled = false;
+bool motorsEnabled = true;
 bool enableLogCanvasOutput = true;
 bool enableLogMotorCommands = true;
 bool enableLogGeneral = true;
@@ -139,7 +130,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     let lastPoint = { x: 0, y: 0 };
     let lastSent = { x: 0, y: 0, pen: 0, time: 0 };
     let currentDpr = 1;
-    let currentColor = '#ff5252';
+    let currentColor = 'rgb(35, 101, 234)';
     let currentStrokeWidth = 2;
 
     function applyCanvasSettings() {
@@ -332,9 +323,8 @@ void logCanvasOutput(int32_t xPixels, int32_t yPixels, bool penDown) {
 
 void logMotorCommands(int32_t xSteps, int32_t ySteps, bool penDown) {
   if (enableLogMotorCommands) {
-    Serial.printf("[MOTOR] X1=%d X2=%d Y=%d pen=%s\n", 
+    Serial.printf("[MOTOR] X=%d Y=%d pen=%s\n", 
                   xSteps, 
-                  X2_OFFSET_STEPS + xSteps * X2_DIRECTION, 
                   ySteps, 
                   penDown ? "DOWN" : "UP");
   }
@@ -512,9 +502,6 @@ void logStatus() {
   Serial.printf("Invert X: %s, Invert Y: %s\n", INVERT_X ? "YES" : "NO", INVERT_Y ? "YES" : "NO");
   Serial.printf("Max speed (steps/s): %.2f, Accel (steps/s^2): %.2f\n", MAX_SPEED_STEPS_PER_SEC, ACCEL_STEPS_PER_SEC2);
 
-  // Secondary X
-  Serial.printf("X2 direction: %d, X2 offset: %ld\n", (int)X2_DIRECTION, (long)X2_OFFSET_STEPS);
-
   // Servo
   Serial.printf("Servo pin: %d, pen up angle: %d, pen down angle: %d\n", SERVO_PIN, PEN_UP_ANGLE, PEN_DOWN_ANGLE);
 
@@ -560,19 +547,13 @@ void initWiFi() {
 }
 
 void configureSteppers() {
-  stepperX1.setMaxSpeed(MAX_SPEED_STEPS_PER_SEC);
-  stepperX1.setAcceleration(ACCEL_STEPS_PER_SEC2);
-  stepperX2.setMaxSpeed(MAX_SPEED_STEPS_PER_SEC);
-  stepperX2.setAcceleration(ACCEL_STEPS_PER_SEC2);
+  stepperX.setMaxSpeed(MAX_SPEED_STEPS_PER_SEC);
+  stepperX.setAcceleration(ACCEL_STEPS_PER_SEC2);
   stepperY.setMaxSpeed(MAX_SPEED_STEPS_PER_SEC);
   stepperY.setAcceleration(ACCEL_STEPS_PER_SEC2);
 }
 
 void updatePen(bool penDown) {
-  // if (penDown == penCurrentlyDown) {
-  //   return;
-  // }
-  penCurrentlyDown = penDown;
   const int targetAngle = penDown ? PEN_DOWN_ANGLE : PEN_UP_ANGLE;
   Serial.printf("Updating pen: %s\n", penDown ? "DOWN" : "UP");
   penServo.write(targetAngle);
@@ -612,16 +593,13 @@ void applyQueuedTarget() {
 
   updatePen(targetPen);
 
-  const int32_t currentX = stepperX1.targetPosition();
+  const int32_t currentX = stepperX.targetPosition();
   const int32_t currentY = stepperY.targetPosition();
   const bool needXMove = (absDiff(targetX, currentX) >= MIN_STEP_DELTA);
   const bool needYMove = (absDiff(targetY, currentY) >= MIN_STEP_DELTA);
 
   if (needXMove) {
-    stepperX1.moveTo(targetX);
-    int32_t x2Target = X2_OFFSET_STEPS + targetX * X2_DIRECTION;
-    x2Target = clampValue<int32_t>(x2Target, X2_MIN_STEPS, X2_MAX_STEPS);
-    stepperX2.moveTo(x2Target);
+    stepperX.moveTo(targetX);
   }
 
   if (needYMove) {
@@ -635,7 +613,7 @@ void setup() {
   updatePen(false);
   Serial.println("Servo initialized - starting test cycle");
 
-  // configureSteppers();
+  configureSteppers();
   initWiFi();
 
   ws.onEvent(onWsEvent);
@@ -654,9 +632,8 @@ void setup() {
 void loop() {
   applyQueuedTarget();
 
-  // stepperX1.run();
-  // stepperX2.run();
-  // stepperY.run();
+  stepperX.run();
+  stepperY.run();
 
   // Read serial lines and process them as commands or drawing payloads.
   // Lines ending in '\n' or '\r' are considered complete.
