@@ -1,10 +1,10 @@
-
 #include <Arduino.h>
 #include <WiFi.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <AccelStepper.h>
 #include <ESP32Servo.h>
+#include <ezButton.h>
 #include <cstring>
 
 // Makerspace Wifi Credentials
@@ -17,6 +17,8 @@ constexpr int X_STEP_PIN = 32;
 constexpr int X_DIR_PIN = 33;
 constexpr int Y_STEP_PIN = 25;
 constexpr int Y_DIR_PIN = 26;
+constexpr int X_LIMIT_PIN = 23;
+constexpr int Y_LIMIT_PIN = 22;
 
 
 // Servo configuration
@@ -31,20 +33,11 @@ constexpr int32_t X_OFFSET_STEPS = 0;
 constexpr int32_t Y_OFFSET_STEPS = 0;
 constexpr bool INVERT_X = true;
 constexpr bool INVERT_Y = true;
-constexpr int32_t X_MIN_STEPS = -400;
-constexpr int32_t X_MAX_STEPS = 400;
-constexpr int32_t Y_MIN_STEPS = -200;
-constexpr int32_t Y_MAX_STEPS = 200;
+constexpr int32_t X_MIN_STEPS = 0;
+constexpr int32_t X_MAX_STEPS = 1200;
+constexpr int32_t Y_MIN_STEPS = 0;
+constexpr int32_t Y_MAX_STEPS = 450;
 
-// Canvas centering: offset pixels so center maps to (0, 0) in steps
-// To center the canvas, we offset pixels so that when the canvas center is clicked, it maps to 0 steps
-// For a symmetric step range centered at 0, we calculate the offset needed
-// Formula: offset = -(step_range_center) / steps_per_pixel
-// Since ranges are symmetric: center = (min + max) / 2 = 0, so we need to offset by the pixel value that would map to 0
-// Using the step range span: if range is -400 to 400 (800 steps), center is at pixel 400 (assuming 1:1 mapping)
-// So offset = -400 to center a typical canvas
-constexpr int32_t CANVAS_CENTER_X_OFFSET = -(X_MAX_STEPS - X_MIN_STEPS) / 2 / STEPS_PER_PIXEL_X;
-constexpr int32_t CANVAS_CENTER_Y_OFFSET = -(Y_MAX_STEPS - Y_MIN_STEPS) / 2 / STEPS_PER_PIXEL_Y;
 
 // Motion dynamics
 constexpr float MAX_SPEED_STEPS_PER_SEC = 300.0f;
@@ -58,6 +51,8 @@ AccelStepper stepperX(AccelStepper::DRIVER, X_STEP_PIN, X_DIR_PIN);
 AccelStepper stepperY(AccelStepper::DRIVER, Y_STEP_PIN, Y_DIR_PIN);
 
 Servo penServo;
+ezButton limitSwitchX(X_LIMIT_PIN);
+ezButton limitSwitchY(Y_LIMIT_PIN);
 bool penCurrentlyDown = false;
 
 portMUX_TYPE targetMux = portMUX_INITIALIZER_UNLOCKED;
@@ -158,6 +153,10 @@ const char index_html[] PROGMEM = R"rawliteral(
     let currentColor = 'rgb(35, 101, 234)';
     let currentStrokeWidth = 2;
 
+    // Plotter physical limits (in steps)
+    const PLOTTER_MAX_X = 1200;
+    const PLOTTER_MAX_Y = 450;
+
     function applyCanvasSettings() {
       ctx.lineWidth = currentStrokeWidth;
       ctx.lineJoin = 'round';
@@ -220,7 +219,24 @@ const char index_html[] PROGMEM = R"rawliteral(
 
     function sendSinglePoint(pt) {
       if (!websocket || websocket.readyState !== WebSocket.OPEN) return;
-      websocket.send(`${Math.round(pt.x)}&${Math.round(pt.y)}-${pt.pen}`);
+      
+      // Map canvas coordinates to plotter steps
+      // We map the entire canvas width/height to the plotter's physical limits
+      // This stretches/squashes the drawing to fit the plotter area.
+      // Alternatively, we could maintain aspect ratio, but let's fill for now.
+      
+      // Canvas dimensions (logical pixels)
+      const w = canvas.width / currentDpr;
+      const h = canvas.height / currentDpr;
+      
+      // Simple linear mapping:
+      // x_steps = (pt.x / canvas_width) * PLOTTER_MAX_X
+      // y_steps = (pt.y / canvas_height) * PLOTTER_MAX_Y
+      
+      const targetX = Math.round((pt.x / w) * PLOTTER_MAX_X);
+      const targetY = Math.round((pt.y / h) * PLOTTER_MAX_Y);
+
+      websocket.send(`${targetX}&${targetY}-${pt.pen}`);
     }
     
     async function submitDrawing() {
@@ -566,22 +582,12 @@ bool processTextPayload(const char *payload) {
   // Log canvas output
   logCanvasOutput(xPixels, yPixels, penDown);
 
-  // Center canvas: offset pixels so center maps to (0, 0) in steps
-  int32_t centeredXPixels = xPixels + CANVAS_CENTER_X_OFFSET;
-  int32_t centeredYPixels = yPixels + CANVAS_CENTER_Y_OFFSET;
+  // Direct mapping: inputs are already in steps from JS
+  int32_t xSteps = xPixels;
+  int32_t ySteps = yPixels;
 
-  // Swap X and Y: X pixels go to Y steps, Y pixels go to X steps
-  int32_t xSteps = pixelsToStepsY(centeredYPixels);
-  int32_t ySteps = pixelsToStepsX(centeredXPixels);
-
-  // Reflect over X axis: flip X steps within bounds
-  // After swapping, Y pixels map to X steps, so we reflect X steps
-  xSteps = X_MAX_STEPS + X_MIN_STEPS - xSteps;
+  // Clamp just in case
   xSteps = clampValue<int32_t>(xSteps, X_MIN_STEPS, X_MAX_STEPS);
-
-  // Reflect over Y axis: flip Y steps within bounds
-  // After swapping, X pixels map to Y steps, so we reflect Y steps
-  ySteps = Y_MAX_STEPS + Y_MIN_STEPS - ySteps;
   ySteps = clampValue<int32_t>(ySteps, Y_MIN_STEPS, Y_MAX_STEPS);
 
   // Log motor commands
@@ -661,7 +667,6 @@ void configureSteppers() {
 
 void updatePen(bool penDown) {
   const int targetAngle = penDown ? PEN_DOWN_ANGLE : PEN_UP_ANGLE;
-  Serial.printf("Updating pen: %s\n", penDown ? "DOWN" : "UP");
   penServo.write(targetAngle);
 }
 
@@ -717,6 +722,85 @@ void applyQueuedTarget() {
   }
 }
 
+void homeAxis(AccelStepper& stepper, ezButton& limitSwitch, int direction) {
+  float originalMaxSpeed = stepper.maxSpeed();
+  stepper.setMaxSpeed(100.0); // Slow speed for homing
+
+  // Move indefinitely in the homing direction
+  stepper.moveTo(direction * 100000);
+
+  while (true) {
+    limitSwitch.loop();
+    if (limitSwitch.getState() == LOW) { // Touched
+      stepper.stop();
+      stepper.setCurrentPosition(0);
+      break;
+    }
+    stepper.run();
+    if (stepper.distanceToGo() == 0) {
+      break;
+    }
+  }
+  
+  stepper.setMaxSpeed(originalMaxSpeed);
+  stepper.moveTo(0);
+}
+
+void measureAxisLength(AccelStepper& stepper, ezButton& limitSwitch, int homeDir, const char* axisName) {
+  Serial.printf("Measuring %s axis length...\n", axisName);
+  
+  // 1. Home to the starting bound
+  homeAxis(stepper, limitSwitch, homeDir);
+  delay(500);
+
+  // 2. Move away to clear the switch
+  Serial.println("Backing off from home...");
+  long backoffSteps = -homeDir * 100; // Move 100 steps away
+  stepper.move(backoffSteps);
+  while (stepper.distanceToGo() != 0) {
+    stepper.run();
+    limitSwitch.loop(); // Keep button updated
+  }
+  
+  if (limitSwitch.getState() == LOW) {
+    Serial.println("Warning: Switch still triggered after backoff!");
+  }
+
+  // 3. Move to the other bound
+  Serial.println("Moving to opposite bound...");
+  float originalMaxSpeed = stepper.maxSpeed();
+  stepper.setMaxSpeed(200.0); // Slower for accuracy
+  
+  // Move effectively forever in opposite direction
+  stepper.moveTo(-homeDir * 1000000); 
+
+  while (true) {
+    stepper.run();
+    
+    // Print position every 10 steps to avoid flooding serial too much, 
+    // but frequently enough to capture the last position.
+    if (abs(stepper.currentPosition()) % 10 == 0) {
+        Serial.printf("Current Position: %ld\n", stepper.currentPosition());
+    }
+    
+    if (stepper.distanceToGo() == 0) {
+      Serial.println("Error: Reached max travel limit (virtual)");
+      break;
+    }
+  }
+
+  long totalSteps = abs(stepper.currentPosition());
+  Serial.printf(">>> %s AXIS TOTAL STEPS: %ld <<<\n", axisName, totalSteps);
+
+  // 4. Return to home
+  stepper.setMaxSpeed(originalMaxSpeed);
+  stepper.moveTo(0);
+  while (stepper.distanceToGo() != 0) {
+    stepper.run();
+  }
+  Serial.println("Returned to home.");
+}
+
 void setup() {
   Serial.begin(115200);
   penServo.attach(SERVO_PIN);
@@ -724,6 +808,22 @@ void setup() {
   Serial.println("Servo initialized - starting test cycle");
 
   configureSteppers();
+  
+  limitSwitchX.setDebounceTime(50);
+  limitSwitchY.setDebounceTime(50);
+
+  Serial.println("Homing X axis...");
+  homeAxis(stepperX, limitSwitchX, 1);
+  Serial.println("X axis homed");
+
+  Serial.println("Homing Y axis...");
+  homeAxis(stepperY, limitSwitchY, 1);
+  Serial.println("Y axis homed");
+
+  // // Calibrate axes (measures total steps)
+  // measureAxisLength(stepperX, limitSwitchX, 1, "X");
+  // measureAxisLength(stepperY, limitSwitchY, 1, "Y");
+
   initWiFi();
 
   ws.onEvent(onWsEvent);
@@ -745,6 +845,8 @@ void loop() {
   stepperX.run();
   stepperY.run();
 
+  limitSwitchX.loop();
+  limitSwitchY.loop();
   // Read serial lines and process them as commands or drawing payloads.
   // Lines ending in '\n' or '\r' are considered complete.
   static char serialLineBuf[128];
