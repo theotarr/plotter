@@ -174,6 +174,10 @@ const char index_html[] PROGMEM = R"rawliteral(
         <button id="setTLBtn" style="flex: 1; font-size: 12px;">Set Top-Left</button>
         <button id="setBRBtn" style="flex: 1; font-size: 12px;">Set Btm-Right</button>
       </div>
+      <div style="display: flex; gap: 8px; margin-bottom: 8px;">
+        <button id="goTLBtn" style="flex: 1; font-size: 12px;">Go Top-Left</button>
+        <button id="goBRBtn" style="flex: 1; font-size: 12px;">Go Btm-Right</button>
+      </div>
       <div style="font-size: 11px; opacity: 0.6; line-height: 1.4;">
         TL: <span id="tlCoord">Not set</span><br>
         BR: <span id="brCoord">Not set</span>
@@ -204,6 +208,8 @@ const char index_html[] PROGMEM = R"rawliteral(
     const jogStepSelect = document.getElementById('jogStepSize');
     const setTLBtn = document.getElementById('setTLBtn');
     const setBRBtn = document.getElementById('setBRBtn');
+    const goTLBtn = document.getElementById('goTLBtn');
+    const goBRBtn = document.getElementById('goBRBtn');
     const tlCoordEl = document.getElementById('tlCoord');
     const brCoordEl = document.getElementById('brCoord');
     
@@ -460,6 +466,18 @@ const char index_html[] PROGMEM = R"rawliteral(
     setBRBtn.addEventListener('click', () => {
       pendingCalType = 'BR';
       websocket.send('cmd:get_pos');
+    });
+    
+    goTLBtn.addEventListener('click', () => {
+      if (!websocket || websocket.readyState !== WebSocket.OPEN) return;
+      // Send command to move to TL coordinates with Pen UP
+      websocket.send(`${calMinX}&${calMinY}-0`);
+    });
+
+    goBRBtn.addEventListener('click', () => {
+      if (!websocket || websocket.readyState !== WebSocket.OPEN) return;
+      // Send command to move to BR coordinates with Pen UP
+      websocket.send(`${calMaxX}&${calMaxY}-0`);
     });
 
     function recordPoint(x, y, pen) {
@@ -1071,18 +1089,87 @@ void applyQueuedTarget() {
   int32_t targetY = cmd.ySteps;
   bool targetPen = cmd.penDown;
 
-  updatePen(targetPen);
-
   const int32_t currentX = stepperX.targetPosition();
   const int32_t currentY = stepperY.targetPosition();
 
   const bool needXMove = (absDiff(targetX, currentX) >= MIN_STEP_DELTA);
   const bool needYMove = (absDiff(targetY, currentY) >= MIN_STEP_DELTA);
 
-  if (needXMove && motorsEnabled)
-    stepperX.moveTo(targetX);
-  if (needYMove && motorsEnabled)
-    stepperY.moveTo(targetY);
+  // Smart pen logic:
+  // If pen is currently UP and target is DOWN: Move first, then put pen DOWN.
+  // If pen is currently DOWN and target is UP: Put pen UP first, then move.
+  // If pen state doesn't change: Just move.
+
+  // Case 1: We are UP and need to go DOWN (Travel Move).
+  if (!penCurrentlyDown && targetPen) {
+      // We need to MOVE first, then DROP.
+      if (needXMove || needYMove) {
+          // Execute the move part now.
+          if (needXMove && motorsEnabled) stepperX.moveTo(targetX);
+          if (needYMove && motorsEnabled) stepperY.moveTo(targetY);
+
+          // CRITICAL: We popped the command, but we only did HALF of it (Move).
+          // The Pen Down part must happen AFTER arrival.
+          // We can "unread" the command or push a new one to the front.
+          // Since our queue is a ring buffer, pushing to front (qTail - 1) is valid 
+          // as long as it's not full (which it isn't, we just popped one).
+          
+          portENTER_CRITICAL(&targetMux);
+          // Decrement tail to "un-pop" essentially, OR push a modified command.
+          // Let's push a new command: {targetX, targetY, true}
+          // But wait, if we just "un-pop", next time we come back, 
+          // penCurrentlyDown is still false, targetPen is true, needMove is FALSE (because we set targets).
+          // So we will fall into the "else" block or a "no move" block?
+          
+          // Let's see what happens if we re-queue the SAME command:
+          // Next loop: needXMove=false, needYMove=false.
+          // It enters logic. 
+          // !penCurrentlyDown && targetPen -> True.
+          // needMove -> False.
+          // So we need a branch here for "No Move Needed".
+          
+          // Let's push the command back to the HEAD (so it's next).
+          // We need to manipulate qTail.
+          size_t prevTail = (qTail == 0) ? (QUEUE_CAPACITY - 1) : (qTail - 1);
+          cmdQueue[prevTail] = cmd; // Put it back
+          qTail = prevTail;
+          portEXIT_CRITICAL(&targetMux);
+          
+          // But wait, if we put it back, next loop will see the exact same state?
+          // No, because we called stepper.moveTo(), so now `stepper.distanceToGo() != 0`.
+          // So `applyQueuedTarget` returns immediately at the top check!
+          // It waits until the move finishes.
+          // When move finishes, we come back here.
+          // CurrentPos == TargetPos. needMove = False.
+          // We enter the block: !penCurrentlyDown && targetPen is True.
+          // needMove is False.
+          // So we fall through to... where?
+      } else {
+          // We are AT the location, and Pen is UP, but Target is DOWN.
+          // Just drop the pen!
+          updatePen(true);
+      }
+  } 
+  // Case 2: We are DOWN and need to go UP (Lift Move).
+  else if (penCurrentlyDown && !targetPen) {
+      // Lift immediately, then move.
+      updatePen(false); 
+      // Delay slightly to allow servo to move? 
+      // A small non-blocking delay is hard here. 
+      // Usually servo is fast enough compared to accel ramp-up.
+      
+      if (needXMove && motorsEnabled) stepperX.moveTo(targetX);
+      if (needYMove && motorsEnabled) stepperY.moveTo(targetY);
+  } 
+  // Case 3: State matches (Down->Down or Up->Up).
+  else {
+      // Just move.
+      // updatePen not needed technically, but good for consistency.
+      updatePen(targetPen); 
+      if (needXMove && motorsEnabled) stepperX.moveTo(targetX);
+      if (needYMove && motorsEnabled) stepperY.moveTo(targetY);
+  }
+
     
   // Check if queue is empty after processing
   portENTER_CRITICAL(&targetMux);
