@@ -80,15 +80,15 @@ const char index_html[] PROGMEM = R"rawliteral(
   <title>Plotter</title>
   <style>
     * { box-sizing: border-box; }
-    html, body { margin: 0; height: 100%; background: #111; color: #f5f5f5; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+    html, body { margin: 0; height: 100%; background: #111; color: #f5f5f5; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; overflow: hidden; }
     #toolbar { position: fixed; top: 0; left: 0; right: 0; display: flex; gap: 12px; align-items: center; padding: 10px 16px; background: rgba(0, 0, 0, 0.35); backdrop-filter: blur(12px); z-index: 10; }
     button { background: #1f1f1f; border: 1px solid #333; border-radius: 8px; color: inherit; font-size: 16px; padding: 8px 14px; cursor: pointer; }
     button:active { background: #2e2e2e; }
     button:hover { background: #2a2a2a; }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
     #status { margin-left: auto; font-size: 14px; opacity: 0.85; }
-    #canvas { display: block; width: 100vw; height: 100vh; cursor: crosshair; touch-action: none; }
-    #settingsPanel { position: fixed; top: 60px; right: 16px; background: rgba(0, 0, 0, 0.9); backdrop-filter: blur(12px); border: 1px solid #333; border-radius: 12px; padding: 20px; min-width: 240px; z-index: 20; display: none; box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5); }
+    #canvas { display: block; width: 100vw; height: 100vh; cursor: crosshair; touch-action: none; position: fixed; top: 0; left: 0; }
+    #settingsPanel { position: fixed; top: 60px; right: 16px; background: rgba(0, 0, 0, 0.9); backdrop-filter: blur(12px); border: 1px solid #333; border-radius: 12px; padding: 20px; min-width: 240px; z-index: 20; display: none; box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5); max-height: calc(100vh - 80px); overflow-y: auto; }
     #settingsPanel.open { display: block; }
     .settings-group { margin-bottom: 20px; padding-bottom: 15px; border-bottom: 1px solid #333; }
     .settings-group:last-child { margin-bottom: 0; border-bottom: none; }
@@ -507,11 +507,12 @@ const char index_html[] PROGMEM = R"rawliteral(
       const targetX = Math.round(calMinX + (normX * rangeX));
       
       // For Y: 
-      // If we assume Bottom-Left origin (0,0) is physically at bottom:
-      // Canvas Y=0 (top) should map to calMaxY (physically top of iPad)
-      // Canvas Y=h (bottom) should map to calMinY (physically bottom of iPad)
-      // This preserves the visual orientation on the screen.
-      const targetY = Math.round(calMinY + ((1.0 - normY) * rangeY));
+      // Canvas Y is 0 at top, increasing downwards.
+      // Plotter Y is 0 at switch (bottom), increasing upwards.
+      // So we need to invert: 
+      // normY=0 (top) -> targetY should be MAX (away from switch)
+      // normY=1 (bottom) -> targetY should be MIN (at switch)
+      const targetY = Math.round(calMinY + (normY * rangeY));
 
       websocket.send(`${targetX}&${targetY}-${pt.pen}`);
     }
