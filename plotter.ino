@@ -31,10 +31,20 @@ constexpr int32_t X_OFFSET_STEPS = 0;
 constexpr int32_t Y_OFFSET_STEPS = 0;
 constexpr bool INVERT_X = true;
 constexpr bool INVERT_Y = true;
-constexpr int32_t X_MIN_STEPS = 0;
-constexpr int32_t X_MAX_STEPS = 600;
-constexpr int32_t Y_MIN_STEPS = 0;
-constexpr int32_t Y_MAX_STEPS = 400;
+constexpr int32_t X_MIN_STEPS = -400;
+constexpr int32_t X_MAX_STEPS = 400;
+constexpr int32_t Y_MIN_STEPS = -200;
+constexpr int32_t Y_MAX_STEPS = 200;
+
+// Canvas centering: offset pixels so center maps to (0, 0) in steps
+// To center the canvas, we offset pixels so that when the canvas center is clicked, it maps to 0 steps
+// For a symmetric step range centered at 0, we calculate the offset needed
+// Formula: offset = -(step_range_center) / steps_per_pixel
+// Since ranges are symmetric: center = (min + max) / 2 = 0, so we need to offset by the pixel value that would map to 0
+// Using the step range span: if range is -400 to 400 (800 steps), center is at pixel 400 (assuming 1:1 mapping)
+// So offset = -400 to center a typical canvas
+constexpr int32_t CANVAS_CENTER_X_OFFSET = -(X_MAX_STEPS - X_MIN_STEPS) / 2 / STEPS_PER_PIXEL_X;
+constexpr int32_t CANVAS_CENTER_Y_OFFSET = -(Y_MAX_STEPS - Y_MIN_STEPS) / 2 / STEPS_PER_PIXEL_Y;
 
 // Motion dynamics
 constexpr float MAX_SPEED_STEPS_PER_SEC = 300.0f;
@@ -368,9 +378,6 @@ int32_t roundToSteps(float value) {
 
 int32_t pixelsToStepsX(int32_t pixels) {
   float base = pixels * STEPS_PER_PIXEL_X;
-  if (INVERT_X) {
-    base = -base;
-  }
   int32_t steps = roundToSteps(base) + X_OFFSET_STEPS;
   if (steps < X_MIN_STEPS) {
     Serial.printf("[BOUNDS] X steps %ld exceeds minimum %ld (clamped)\n", (long)steps, (long)X_MIN_STEPS);
@@ -382,9 +389,6 @@ int32_t pixelsToStepsX(int32_t pixels) {
 
 int32_t pixelsToStepsY(int32_t pixels) {
   float base = pixels * STEPS_PER_PIXEL_Y;
-  if (INVERT_Y) {
-    base = -base;
-  }
   int32_t steps = roundToSteps(base) + Y_OFFSET_STEPS;
   if (steps < Y_MIN_STEPS) {
     Serial.printf("[BOUNDS] Y steps %ld exceeds minimum %ld (clamped)\n", (long)steps, (long)Y_MIN_STEPS);
@@ -562,8 +566,23 @@ bool processTextPayload(const char *payload) {
   // Log canvas output
   logCanvasOutput(xPixels, yPixels, penDown);
 
-  int32_t xSteps = pixelsToStepsX(xPixels);
-  int32_t ySteps = pixelsToStepsY(yPixels);
+  // Center canvas: offset pixels so center maps to (0, 0) in steps
+  int32_t centeredXPixels = xPixels + CANVAS_CENTER_X_OFFSET;
+  int32_t centeredYPixels = yPixels + CANVAS_CENTER_Y_OFFSET;
+
+  // Swap X and Y: X pixels go to Y steps, Y pixels go to X steps
+  int32_t xSteps = pixelsToStepsY(centeredYPixels);
+  int32_t ySteps = pixelsToStepsX(centeredXPixels);
+
+  // Reflect over X axis: flip X steps within bounds
+  // After swapping, Y pixels map to X steps, so we reflect X steps
+  xSteps = X_MAX_STEPS + X_MIN_STEPS - xSteps;
+  xSteps = clampValue<int32_t>(xSteps, X_MIN_STEPS, X_MAX_STEPS);
+
+  // Reflect over Y axis: flip Y steps within bounds
+  // After swapping, X pixels map to Y steps, so we reflect Y steps
+  ySteps = Y_MAX_STEPS + Y_MIN_STEPS - ySteps;
+  ySteps = clampValue<int32_t>(ySteps, Y_MIN_STEPS, Y_MAX_STEPS);
 
   // Log motor commands
   logMotorCommands(xSteps, ySteps, penDown);
