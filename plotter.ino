@@ -23,7 +23,7 @@ constexpr int Y_LIMIT_PIN = 22;
 // Servo configuration
 constexpr int SERVO_PIN = 27;
 constexpr int PEN_UP_ANGLE = 90;
-constexpr int PEN_DOWN_ANGLE = 45;
+int PEN_DOWN_ANGLE = 45; // Mutable for runtime adjustment
 
 // Motion calibration (tune for your machine)
 constexpr float STEPS_PER_PIXEL_X = 1.0f;
@@ -90,8 +90,8 @@ const char index_html[] PROGMEM = R"rawliteral(
     #canvas { display: block; width: 100vw; height: 100vh; cursor: crosshair; touch-action: none; }
     #settingsPanel { position: fixed; top: 60px; right: 16px; background: rgba(0, 0, 0, 0.9); backdrop-filter: blur(12px); border: 1px solid #333; border-radius: 12px; padding: 20px; min-width: 240px; z-index: 20; display: none; box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5); }
     #settingsPanel.open { display: block; }
-    .settings-group { margin-bottom: 20px; }
-    .settings-group:last-child { margin-bottom: 0; }
+    .settings-group { margin-bottom: 20px; padding-bottom: 15px; border-bottom: 1px solid #333; }
+    .settings-group:last-child { margin-bottom: 0; border-bottom: none; }
     .settings-label { display: block; font-size: 13px; margin-bottom: 8px; opacity: 0.9; font-weight: 500; }
     #colorPicker { width: 100%; height: 40px; border: 1px solid #444; border-radius: 8px; cursor: pointer; background: transparent; }
     #strokeWidthInput { width: 100%; height: 36px; background: #1f1f1f; border: 1px solid #444; border-radius: 8px; color: inherit; font-size: 14px; padding: 0 12px; }
@@ -106,6 +106,11 @@ const char index_html[] PROGMEM = R"rawliteral(
     .control-pad button { width: 40px; height: 40px; padding: 0; display: flex; align-items: center; justify-content: center; font-size: 20px; background: #2a2a2a; }
     .control-pad button:active { background: #ff5252; border-color: #ff5252; }
     .instruction { text-align: center; font-size: 12px; opacity: 0.6; margin-top: 8px; }
+    #gamePanel { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: rgba(0, 0, 0, 0.85); backdrop-filter: blur(12px); border: 1px solid #333; border-radius: 12px; padding: 15px 20px; display: none; z-index: 15; text-align: center; min-width: 300px; }
+    #gamePanel.visible { display: block; }
+    .game-status { font-size: 18px; margin-bottom: 10px; font-weight: bold; color: #fff; }
+    .game-controls { display: flex; gap: 10px; justify-content: center; }
+    .game-controls button { flex: 1; font-size: 14px; padding: 10px; }
   </style>
 </head>
 <body>
@@ -113,7 +118,16 @@ const char index_html[] PROGMEM = R"rawliteral(
     <button id="clearBtn">Clear</button>
     <button id="submitBtn">Submit</button>
     <button id="settingsBtn">Settings</button>
+    <button id="gameBtn">Telephone</button>
     <div id="status">Offline</div>
+  </div>
+  
+  <div id="gamePanel">
+    <div class="game-status" id="gameStatusText">Waiting for Input</div>
+    <div class="game-controls">
+      <button id="gameActionBtn">Start Round</button>
+      <button id="gameResetBtn">Reset Game</button>
+    </div>
   </div>
   <div id="settingsPanel">
     <div class="settings-group">
@@ -127,6 +141,13 @@ const char index_html[] PROGMEM = R"rawliteral(
         <span id="strokeWidthValue">2</span>
       </div>
       <input type="number" id="strokeWidthInput" min="1" max="50" value="2" step="1">
+    </div>
+    <div class="settings-group">
+      <label class="settings-label" for="penAngleSlider">Pen Down Angle</label>
+      <div class="stroke-width-display">
+        <input type="range" id="penAngleSlider" min="0" max="180" value="45" step="1">
+        <span id="penAngleValue">45</span>
+      </div>
     </div>
     <div class="settings-group">
       <label class="settings-label">Manual Control</label>
@@ -147,6 +168,17 @@ const char index_html[] PROGMEM = R"rawliteral(
           <option value="100">100 Steps</option>
       </select>
     </div>
+    <div class="settings-group">
+      <label class="settings-label">Calibration</label>
+      <div style="display: flex; gap: 8px; margin-bottom: 8px;">
+        <button id="setTLBtn" style="flex: 1; font-size: 12px;">Set Top-Left</button>
+        <button id="setBRBtn" style="flex: 1; font-size: 12px;">Set Btm-Right</button>
+      </div>
+      <div style="font-size: 11px; opacity: 0.6; line-height: 1.4;">
+        TL: <span id="tlCoord">Not set</span><br>
+        BR: <span id="brCoord">Not set</span>
+      </div>
+    </div>
   </div>
   <canvas id="canvas"></canvas>
   <script>
@@ -156,12 +188,48 @@ const char index_html[] PROGMEM = R"rawliteral(
     const clearBtn = document.getElementById('clearBtn');
     const submitBtn = document.getElementById('submitBtn');
     const settingsBtn = document.getElementById('settingsBtn');
+    const gameBtn = document.getElementById('gameBtn');
     const settingsPanel = document.getElementById('settingsPanel');
+    const gamePanel = document.getElementById('gamePanel');
+    const gameStatusText = document.getElementById('gameStatusText');
+    const gameActionBtn = document.getElementById('gameActionBtn');
+    const gameResetBtn = document.getElementById('gameResetBtn');
+    
     const colorPicker = document.getElementById('colorPicker');
     const strokeWidthSlider = document.getElementById('strokeWidthSlider');
     const strokeWidthInput = document.getElementById('strokeWidthInput');
     const strokeWidthValue = document.getElementById('strokeWidthValue');
+    const penAngleSlider = document.getElementById('penAngleSlider');
+    const penAngleValue = document.getElementById('penAngleValue');
     const jogStepSelect = document.getElementById('jogStepSize');
+    const setTLBtn = document.getElementById('setTLBtn');
+    const setBRBtn = document.getElementById('setBRBtn');
+    const tlCoordEl = document.getElementById('tlCoord');
+    const brCoordEl = document.getElementById('brCoord');
+    
+    // Plotter physical limits (in steps)
+    const PLOTTER_MAX_X = 1200;
+    const PLOTTER_MAX_Y = 450;
+
+    // Calibration state
+    let calMinX = 0;
+    let calMinY = 0;
+    let calMaxX = PLOTTER_MAX_X;
+    let calMaxY = PLOTTER_MAX_Y;
+
+    // Load saved calibration
+    if (localStorage.getItem('plotter_cal')) {
+      try {
+        const saved = JSON.parse(localStorage.getItem('plotter_cal'));
+        calMinX = saved.minX;
+        calMinY = saved.minY;
+        calMaxX = saved.maxX;
+        calMaxY = saved.maxY;
+        tlCoordEl.textContent = `${calMinX}, ${calMinY}`;
+        brCoordEl.textContent = `${calMaxX}, ${calMaxY}`;
+      } catch(e) { console.error(e); }
+    }
+
     const gateway = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`;
     
     let websocket;
@@ -174,11 +242,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     let currentDpr = 1;
     let currentColor = '#2365ea';
     let currentStrokeWidth = 2;
-
-    // Plotter physical limits (in steps)
-    const PLOTTER_MAX_X = 1200;
-    const PLOTTER_MAX_Y = 450;
-
+    
     function applyCanvasSettings() {
       ctx.lineWidth = currentStrokeWidth;
       ctx.lineJoin = 'round';
@@ -250,14 +314,168 @@ const char index_html[] PROGMEM = R"rawliteral(
             ackResolver();
             ackResolver = null;
           }
+        } else if (event.data.startsWith("pos:")) {
+          const parts = event.data.substring(4).split(',');
+          const x = parseInt(parts[0]);
+          const y = parseInt(parts[1]);
+          if (pendingCalType === 'TL') {
+            calMinX = x;
+            calMinY = y;
+            tlCoordEl.textContent = `${x}, ${y}`;
+          } else if (pendingCalType === 'BR') {
+            calMaxX = x;
+            calMaxY = y;
+            brCoordEl.textContent = `${x}, ${y}`;
+          }
+          // Save calibration
+          localStorage.setItem('plotter_cal', JSON.stringify({
+            minX: calMinX, minY: calMinY, maxX: calMaxX, maxY: calMaxY
+          }));
+          pendingCalType = null;
         }
       };
     }
 
+    let pendingCalType = null;
+
+    // --- TELEPHONE GAME LOGIC ---
+    let gameMode = false;
+    let gameState = 'IDLE'; // IDLE, RECORDING_USER, REPLAYING
+    let nextRoundBuffer = [];
+    let isReplaying = false;
+
+    gameBtn.addEventListener('click', () => {
+        gameMode = !gameMode;
+        gameBtn.style.background = gameMode ? '#2365ea' : '#1f1f1f';
+        gamePanel.classList.toggle('visible', gameMode);
+        if (gameMode) resetGame();
+    });
+
+    function resetGame() {
+        gameState = 'IDLE';
+        pointsBuffer = [];
+        nextRoundBuffer = [];
+        isReplaying = false;
+        updateGameUI();
+        // Clear canvas
+        clearBtn.click();
+    }
+
+    function updateGameUI() {
+        if (!gameMode) return;
+        switch(gameState) {
+            case 'IDLE':
+                gameStatusText.textContent = "Draw something & Click Start";
+                gameActionBtn.textContent = "Start Round 1";
+                gameActionBtn.disabled = false;
+                break;
+            case 'RECORDING_USER':
+                // Not really a state, transitioning immediately usually
+                break;
+            case 'REPLAYING':
+                gameStatusText.textContent = "Robot Drawing...";
+                gameActionBtn.textContent = "Please Wait";
+                gameActionBtn.disabled = true;
+                break;
+            case 'ROUND_DONE':
+                gameStatusText.textContent = "Round Complete. Next?";
+                gameActionBtn.textContent = "Start Next Round";
+                gameActionBtn.disabled = false;
+                break;
+        }
+    }
+
+    gameActionBtn.addEventListener('click', () => {
+        if (gameState === 'IDLE') {
+            // User has drawn something manually. 
+            // Convert current pointsBuffer to the source for the robot
+            if (pointsBuffer.length === 0) {
+                alert("Draw something first!");
+                return;
+            }
+            startRobotRound(pointsBuffer);
+        } else if (gameState === 'ROUND_DONE') {
+            // Use the buffer we captured during the last robot session
+            if (nextRoundBuffer.length === 0) {
+                alert("No input detected from last round!");
+                return;
+            }
+            // Clear screen for clean drawing
+            clearBtn.click();
+            
+            // Swap buffers: nextRoundBuffer becomes the source
+            const sourcePoints = [...nextRoundBuffer];
+            nextRoundBuffer = []; // Clear for new recording
+            
+            startRobotRound(sourcePoints);
+        }
+    });
+
+    gameResetBtn.addEventListener('click', resetGame);
+
+    async function startRobotRound(points) {
+        gameState = 'REPLAYING';
+        isReplaying = true;
+        updateGameUI();
+        
+        // Send points to robot
+        // Note: We use a modified submit logic here to allow simultaneous recording
+        await sendPointsForGame(points);
+    }
+
+    // Modified sender that doesn't block UI interaction events (so we can record)
+    async function sendPointsForGame(points) {
+        if (isSending) return;
+        isSending = true;
+        updateStatus('Robot Drawing...', true);
+        
+        try {
+            for (let pt of points) {
+                sendSinglePoint(pt);
+                await new Promise(resolve => {
+                    ackResolver = resolve;
+                    setTimeout(resolve, 2000);
+                });
+            }
+            // Wait for final "Idle" or empty queue from firmware? 
+            // For now, we rely on the ACK loop finishing.
+            // Ideally, we wait for a "JobDone" message.
+        } catch (e) {
+            console.error(e);
+        } finally {
+            isSending = false;
+            isReplaying = false;
+            gameState = 'ROUND_DONE';
+            updateGameUI();
+            updateStatus('Round Done', true);
+        }
+    }
+
+    
+    setTLBtn.addEventListener('click', () => {
+      pendingCalType = 'TL';
+      websocket.send('cmd:get_pos');
+    });
+    
+    setBRBtn.addEventListener('click', () => {
+      pendingCalType = 'BR';
+      websocket.send('cmd:get_pos');
+    });
+
     function recordPoint(x, y, pen) {
       const now = performance.now();
-      if (pointsBuffer.length > 0) {
-        const last = pointsBuffer[pointsBuffer.length - 1];
+      
+      // Decide which buffer to use
+      // If game mode is active AND we are in REPLAYING state, we record to nextRoundBuffer
+      // Otherwise, we record to the standard pointsBuffer (user drawing manually)
+      let targetBuffer = pointsBuffer;
+      
+      if (gameMode && isReplaying) {
+          targetBuffer = nextRoundBuffer;
+      }
+      
+      if (targetBuffer.length > 0) {
+        const last = targetBuffer[targetBuffer.length - 1];
         if (pen === last.pen &&
             Math.abs(x - last.x) < 1 &&
             Math.abs(y - last.y) < 1 &&
@@ -265,28 +483,35 @@ const char index_html[] PROGMEM = R"rawliteral(
           return;
         }
       }
-      pointsBuffer.push({ x, y, pen, time: now });
+      targetBuffer.push({ x, y, pen, time: now });
     }
 
     function sendSinglePoint(pt) {
       if (!websocket || websocket.readyState !== WebSocket.OPEN) return;
       
-      // Map canvas coordinates to plotter steps
-      // We map the entire canvas width/height to the plotter's physical limits
-      // This stretches/squashes the drawing to fit the plotter area.
-      // Alternatively, we could maintain aspect ratio, but let's fill for now.
+      // Map canvas coordinates to plotter steps using CALIBRATION BOUNDS
       
       // Canvas dimensions (logical pixels)
       const w = canvas.width / currentDpr;
       const h = canvas.height / currentDpr;
       
-      // Simple linear mapping:
-      // x_steps = (pt.x / canvas_width) * PLOTTER_MAX_X
-      // y_steps = ((h - pt.y) / canvas_height) * PLOTTER_MAX_Y  <-- Inverted Y for bottom-left origin
+      // Calibration bounds range
+      const rangeX = calMaxX - calMinX;
+      const rangeY = calMaxY - calMinY; // Note: Inverted Y logic applies relative to these steps
       
-      const targetX = Math.round((pt.x / w) * PLOTTER_MAX_X);
-      // Invert Y: Canvas (0 at top) -> Plotter (Max at top)
-      const targetY = Math.round(((h - pt.y) / h) * PLOTTER_MAX_Y);
+      // Normalize input (0..1)
+      const normX = pt.x / w;
+      const normY = pt.y / h;
+      
+      // Map to step range + offset
+      const targetX = Math.round(calMinX + (normX * rangeX));
+      
+      // For Y: 
+      // If we assume Bottom-Left origin (0,0) is physically at bottom:
+      // Canvas Y=0 (top) should map to calMaxY (physically top of iPad)
+      // Canvas Y=h (bottom) should map to calMinY (physically bottom of iPad)
+      // This preserves the visual orientation on the screen.
+      const targetY = Math.round(calMinY + ((1.0 - normY) * rangeY));
 
       websocket.send(`${targetX}&${targetY}-${pt.pen}`);
     }
@@ -335,10 +560,14 @@ const char index_html[] PROGMEM = R"rawliteral(
     }
 
     function startDraw(evt) {
-      if (isSending) return;
+      // If sending normally (submit button), block. 
+      // But if REPLAYING (game mode), we MUST allow events to pass to recordPoint
+      if (isSending && !isReplaying) return;
       evt.preventDefault();
       drawing = true;
       lastPoint = getCanvasPoint(evt);
+      // Only draw visually if user is manually drawing, OR if we want to see the feedback line?
+      // Let's allow visual drawing always for feedback.
       applyCanvasSettings();
       ctx.beginPath();
       ctx.moveTo(lastPoint.x, lastPoint.y);
@@ -346,7 +575,10 @@ const char index_html[] PROGMEM = R"rawliteral(
     }
 
     function moveDraw(evt) {
-      if (!drawing || isSending) return;
+      if (!drawing) return;
+      // Block if sending regular job, allow if Replaying game
+      if (isSending && !isReplaying) return;
+      
       evt.preventDefault();
       const point = getCanvasPoint(evt);
       ctx.lineTo(point.x, point.y);
@@ -356,7 +588,9 @@ const char index_html[] PROGMEM = R"rawliteral(
     }
 
     function endDraw(evt) {
-      if (!drawing || isSending) return;
+      if (!drawing) return;
+       if (isSending && !isReplaying) return;
+       
       evt.preventDefault();
       drawing = false;
       recordPoint(lastPoint.x, lastPoint.y, 0);
@@ -429,6 +663,14 @@ const char index_html[] PROGMEM = R"rawliteral(
 
     window.addEventListener('resize', resizeCanvas);
     resizeCanvas();
+    penAngleSlider.addEventListener('input', (e) => {
+      const val = e.target.value;
+      penAngleValue.textContent = val;
+      if (websocket && websocket.readyState === WebSocket.OPEN) {
+        websocket.send(`cmd:pen_angle:${val}`);
+      }
+    });
+
     function getJogStep() {
       return parseInt(jogStepSelect.value) || 1;
     }
@@ -671,9 +913,23 @@ bool processTextPayload(const char *payload) {
         queueTargetSteps(targetX, targetY, penCurrentlyDown);
       }
       return true;
+    } else if (strncmp(cmd, "pen_angle:", 10) == 0) {
+      int angle = atoi(cmd + 10);
+      angle = clampValue(angle, 0, 180);
+      PEN_DOWN_ANGLE = angle;
+      if (penCurrentlyDown) {
+        penServo.write(PEN_DOWN_ANGLE);
+      }
+      Serial.printf("Pen down angle set to %d\n", PEN_DOWN_ANGLE);
+      return true;
+    } else if (strcmp(cmd, "get_pos") == 0) {
+       Serial.printf("pos:%ld,%ld\n", stepperX.currentPosition(), stepperY.currentPosition());
+       // Also send to WebSocket
+       char buf[64];
+       snprintf(buf, sizeof(buf), "pos:%ld,%ld", stepperX.currentPosition(), stepperY.currentPosition());
+       ws.textAll(buf);
+       return true;
     }
-    // Unknown command, ignore
-    return false;
   }
 
   // Parse drawing coordinates (format: "x&y-pen")
@@ -826,7 +1082,38 @@ void applyQueuedTarget() {
     stepperX.moveTo(targetX);
   if (needYMove && motorsEnabled)
     stepperY.moveTo(targetY);
+    
+  // Check if queue is empty after processing
+  portENTER_CRITICAL(&targetMux);
+  bool isEmpty = (qHead == qTail) && (stepperX.distanceToGo() == 0) && (stepperY.distanceToGo() == 0);
+  portEXIT_CRITICAL(&targetMux);
+  
+  if (isEmpty) {
+      // Simple debounce or state check could be added here if needed
+      // For now, we just let the loop continue.
+      // A more robust "IDLE" check is done in the main loop.
+  }
 }
+
+// Track idle state to send notification
+bool wasIdle = true;
+
+void checkIdleStatus() {
+    bool isIdle = (stepperX.distanceToGo() == 0) && (stepperY.distanceToGo() == 0);
+    // Also check queue
+    portENTER_CRITICAL(&targetMux);
+    if (qHead != qTail) isIdle = false;
+    portEXIT_CRITICAL(&targetMux);
+    
+    if (isIdle && !wasIdle) {
+        // Transitioned to Idle
+        ws.textAll("status:idle");
+        wasIdle = true;
+    } else if (!isIdle) {
+        wasIdle = false;
+    }
+}
+
 
 void homeAxis(AccelStepper &stepper, ezButton &limitSwitch, int direction) {
   float originalMaxSpeed = stepper.maxSpeed();
@@ -975,6 +1262,9 @@ void loop() {
 
   stepperX.run();
   stepperY.run();
+  
+  checkIdleStatus();
+  
   // Read serial lines and process them as commands or drawing payloads.
   // Lines ending in '\n' or '\r' are considered complete.
   static char serialLineBuf[128];
