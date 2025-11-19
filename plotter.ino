@@ -106,7 +106,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     .control-pad button { width: 40px; height: 40px; padding: 0; display: flex; align-items: center; justify-content: center; font-size: 20px; background: #2a2a2a; }
     .control-pad button:active { background: #ff5252; border-color: #ff5252; }
     .instruction { text-align: center; font-size: 12px; opacity: 0.6; margin-top: 8px; }
-    #gamePanel { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: rgba(0, 0, 0, 0.85); backdrop-filter: blur(12px); border: 1px solid #333; border-radius: 12px; padding: 15px 20px; display: none; z-index: 15; text-align: center; min-width: 300px; }
+    #gamePanel { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); background: rgba(0, 0, 0, 0.85); backdrop-filter: blur(12px); border: 1px solid #333; border-radius: 12px; padding: 15px 20px; display: none; z-index: 15; text-align: center; min-width: 300px; }
     #gamePanel.visible { display: block; }
     .game-status { font-size: 18px; margin-bottom: 10px; font-weight: bold; color: #fff; }
     .game-controls { display: flex; gap: 10px; justify-content: center; }
