@@ -1,3 +1,4 @@
+
 #include <Arduino.h>
 #include <WiFi.h>
 #include <AsyncTCP.h>
@@ -6,34 +7,34 @@
 #include <ESP32Servo.h>
 #include <cstring>
 
-
 // Makerspace Wifi Credentials
-constexpr char *ssid = "MAKERSPACE";
-constexpr char *password = "12345678";
+const char *ssid = "MAKERSPACE";
+const char *password = "12345678";
 constexpr int WIFI_CONNECT_TIMEOUT_MS = 20000;
 
-// Stepper pins
+// Stepper pin assignments
 constexpr int X_STEP_PIN = 32;
 constexpr int X_DIR_PIN = 33;
 constexpr int Y_STEP_PIN = 25;
 constexpr int Y_DIR_PIN = 26;
 
+
 // Servo configuration
 constexpr int SERVO_PIN = 27;
-constexpr int PEN_UP_ANGLE = 45;
-constexpr int PEN_DOWN_ANGLE = 90;
+constexpr int PEN_UP_ANGLE = 90;
+constexpr int PEN_DOWN_ANGLE = 45;
 
 // Motion calibration (tune for your machine)
 constexpr float STEPS_PER_PIXEL_X = 1.0f;
 constexpr float STEPS_PER_PIXEL_Y = 1.0f;
 constexpr int32_t X_OFFSET_STEPS = 0;
 constexpr int32_t Y_OFFSET_STEPS = 0;
-constexpr bool INVERT_X = false;
-constexpr bool INVERT_Y = false;
+constexpr bool INVERT_X = true;
+constexpr bool INVERT_Y = true;
 constexpr int32_t X_MIN_STEPS = 0;
-constexpr int32_t X_MAX_STEPS = 20000;
+constexpr int32_t X_MAX_STEPS = 600;
 constexpr int32_t Y_MIN_STEPS = 0;
-constexpr int32_t Y_MAX_STEPS = 15000;
+constexpr int32_t Y_MAX_STEPS = 400;
 
 // Motion dynamics
 constexpr float MAX_SPEED_STEPS_PER_SEC = 300.0f;
@@ -50,10 +51,17 @@ Servo penServo;
 bool penCurrentlyDown = false;
 
 portMUX_TYPE targetMux = portMUX_INITIALIZER_UNLOCKED;
-volatile bool newTargetQueued = false;
-volatile int32_t queuedTargetX = 0;
-volatile int32_t queuedTargetY = 0;
-volatile bool queuedPenDown = false;
+
+struct PlotCmd {
+  int32_t xSteps;
+  int32_t ySteps;
+  bool penDown;
+};
+
+constexpr size_t QUEUE_CAPACITY = 500;
+PlotCmd cmdQueue[QUEUE_CAPACITY];
+volatile size_t qHead = 0;
+volatile size_t qTail = 0;
 
 // Control flags
 bool motorsEnabled = true;
@@ -75,6 +83,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     button { background: #1f1f1f; border: 1px solid #333; border-radius: 8px; color: inherit; font-size: 16px; padding: 8px 14px; cursor: pointer; }
     button:active { background: #2e2e2e; }
     button:hover { background: #2a2a2a; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
     #status { margin-left: auto; font-size: 14px; opacity: 0.85; }
     #canvas { display: block; width: 100vw; height: 100vh; cursor: crosshair; touch-action: none; }
     #settingsPanel { position: fixed; top: 60px; right: 16px; background: rgba(0, 0, 0, 0.9); backdrop-filter: blur(12px); border: 1px solid #333; border-radius: 12px; padding: 20px; min-width: 240px; z-index: 20; display: none; box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5); }
@@ -95,6 +104,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 <body>
   <div id="toolbar">
     <button id="clearBtn">Clear</button>
+    <button id="submitBtn">Submit</button>
     <button id="settingsBtn">Settings</button>
     <div id="status">Offline</div>
   </div>
@@ -118,6 +128,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     const ctx = canvas.getContext('2d');
     const statusEl = document.getElementById('status');
     const clearBtn = document.getElementById('clearBtn');
+    const submitBtn = document.getElementById('submitBtn');
     const settingsBtn = document.getElementById('settingsBtn');
     const settingsPanel = document.getElementById('settingsPanel');
     const colorPicker = document.getElementById('colorPicker');
@@ -125,10 +136,14 @@ const char index_html[] PROGMEM = R"rawliteral(
     const strokeWidthInput = document.getElementById('strokeWidthInput');
     const strokeWidthValue = document.getElementById('strokeWidthValue');
     const gateway = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`;
+    
     let websocket;
     let drawing = false;
     let lastPoint = { x: 0, y: 0 };
-    let lastSent = { x: 0, y: 0, pen: 0, time: 0 };
+    let pointsBuffer = [];
+    let isSending = false;
+    let ackResolver = null;
+    
     let currentDpr = 1;
     let currentColor = 'rgb(35, 101, 234)';
     let currentStrokeWidth = 2;
@@ -168,19 +183,68 @@ const char index_html[] PROGMEM = R"rawliteral(
         setTimeout(initWebSocket, 1500);
       };
       websocket.onerror = () => websocket.close();
+      
+      websocket.onmessage = (event) => {
+        if (event.data === "ACK") {
+          if (ackResolver) {
+            ackResolver();
+            ackResolver = null;
+          }
+        }
+      };
     }
 
-    function sendPoint(x, y, pen) {
-      if (!websocket || websocket.readyState !== WebSocket.OPEN) return;
+    function recordPoint(x, y, pen) {
       const now = performance.now();
-      if (pen === lastSent.pen &&
-          Math.abs(x - lastSent.x) < 1 &&
-          Math.abs(y - lastSent.y) < 1 &&
-          now - lastSent.time < 10) {
-        return;
+      if (pointsBuffer.length > 0) {
+        const last = pointsBuffer[pointsBuffer.length - 1];
+        if (pen === last.pen &&
+            Math.abs(x - last.x) < 1 &&
+            Math.abs(y - last.y) < 1 &&
+            now - last.time < 10) {
+          return;
+        }
       }
-      lastSent = { x, y, pen, time: now };
-      websocket.send(`${Math.round(x)}&${Math.round(y)}-${pen}`);
+      pointsBuffer.push({ x, y, pen, time: now });
+    }
+
+    function sendSinglePoint(pt) {
+      if (!websocket || websocket.readyState !== WebSocket.OPEN) return;
+      websocket.send(`${Math.round(pt.x)}&${Math.round(pt.y)}-${pt.pen}`);
+    }
+    
+    async function submitDrawing() {
+        if (isSending) return;
+        if (pointsBuffer.length === 0) {
+            updateStatus('Nothing to send', false);
+            return;
+        }
+        
+        isSending = true;
+        submitBtn.disabled = true;
+        clearBtn.disabled = true;
+        updateStatus('Sending...', true);
+        
+        try {
+            for (let pt of pointsBuffer) {
+                sendSinglePoint(pt);
+                await new Promise(resolve => {
+                    ackResolver = resolve;
+                    // Timeout fallback just in case
+                    setTimeout(resolve, 2000);
+                });
+            }
+            updateStatus('Sent!', true);
+        } catch (e) {
+            updateStatus('Error sending', false);
+            console.error(e);
+        } finally {
+            pointsBuffer = []; // Clear buffer after successful send
+            isSending = false;
+            submitBtn.disabled = false;
+            clearBtn.disabled = false;
+            // Optional: Clear canvas here if desired? Probably not, user might want to see what they sent.
+        }
     }
 
     function getCanvasPoint(evt) {
@@ -193,33 +257,35 @@ const char index_html[] PROGMEM = R"rawliteral(
     }
 
     function startDraw(evt) {
+      if (isSending) return;
       evt.preventDefault();
       drawing = true;
       lastPoint = getCanvasPoint(evt);
       applyCanvasSettings();
       ctx.beginPath();
       ctx.moveTo(lastPoint.x, lastPoint.y);
-      sendPoint(lastPoint.x, lastPoint.y, 1);
+      recordPoint(lastPoint.x, lastPoint.y, 1);
     }
 
     function moveDraw(evt) {
-      if (!drawing) return;
+      if (!drawing || isSending) return;
       evt.preventDefault();
       const point = getCanvasPoint(evt);
       ctx.lineTo(point.x, point.y);
       ctx.stroke();
       lastPoint = point;
-      sendPoint(point.x, point.y, 1);
+      recordPoint(point.x, point.y, 1);
     }
 
     function endDraw(evt) {
-      if (!drawing) return;
+      if (!drawing || isSending) return;
       evt.preventDefault();
       drawing = false;
-      sendPoint(lastPoint.x, lastPoint.y, 0);
+      recordPoint(lastPoint.x, lastPoint.y, 0);
     }
 
     clearBtn.addEventListener('click', () => {
+      if (isSending) return;
       ctx.save();
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -227,8 +293,10 @@ const char index_html[] PROGMEM = R"rawliteral(
       ctx.fillStyle = '#111';
       ctx.fillRect(0, 0, canvas.width / currentDpr, canvas.height / currentDpr);
       ctx.beginPath();
-      lastSent = { x: 0, y: 0, pen: 0, time: 0 };
+      pointsBuffer = [];
     });
+    
+    submitBtn.addEventListener('click', submitDrawing);
 
     settingsBtn.addEventListener('click', () => {
       settingsPanel.classList.toggle('open');
@@ -297,12 +365,18 @@ int32_t roundToSteps(float value) {
   return static_cast<int32_t>((value >= 0.0f) ? (value + 0.5f) : (value - 0.5f));
 }
 
+
 int32_t pixelsToStepsX(int32_t pixels) {
   float base = pixels * STEPS_PER_PIXEL_X;
   if (INVERT_X) {
     base = -base;
   }
   int32_t steps = roundToSteps(base) + X_OFFSET_STEPS;
+  if (steps < X_MIN_STEPS) {
+    Serial.printf("[BOUNDS] X steps %ld exceeds minimum %ld (clamped)\n", (long)steps, (long)X_MIN_STEPS);
+  } else if (steps > X_MAX_STEPS) {
+    Serial.printf("[BOUNDS] X steps %ld exceeds maximum %ld (clamped)\n", (long)steps, (long)X_MAX_STEPS);
+  }
   return clampValue<int32_t>(steps, X_MIN_STEPS, X_MAX_STEPS);
 }
 
@@ -312,6 +386,11 @@ int32_t pixelsToStepsY(int32_t pixels) {
     base = -base;
   }
   int32_t steps = roundToSteps(base) + Y_OFFSET_STEPS;
+  if (steps < Y_MIN_STEPS) {
+    Serial.printf("[BOUNDS] Y steps %ld exceeds minimum %ld (clamped)\n", (long)steps, (long)Y_MIN_STEPS);
+  } else if (steps > Y_MAX_STEPS) {
+    Serial.printf("[BOUNDS] Y steps %ld exceeds maximum %ld (clamped)\n", (long)steps, (long)Y_MAX_STEPS);
+  }
   return clampValue<int32_t>(steps, Y_MIN_STEPS, Y_MAX_STEPS);
 }
 
@@ -336,16 +415,20 @@ void logGeneral(const char* message) {
   }
 }
 
-void queueTargetSteps(int32_t xSteps, int32_t ySteps, bool penDown) {
+bool queueTargetSteps(int32_t xSteps, int32_t ySteps, bool penDown) {
+  bool success = false;
   portENTER_CRITICAL(&targetMux);
-  queuedTargetX = xSteps;
-  queuedTargetY = ySteps;
-  queuedPenDown = penDown;
-  newTargetQueued = true;
+  size_t nextHead = (qHead + 1) % QUEUE_CAPACITY;
+  if (nextHead != qTail) {
+    cmdQueue[qHead] = {xSteps, ySteps, penDown};
+    qHead = nextHead;
+    success = true;
+  }
   portEXIT_CRITICAL(&targetMux);
+  return success;
 }
 
-void handleWebSocketMessage(void *arg, uint8_t *data, size_t len) {
+void handleWebSocketMessage(AsyncWebSocketClient *client, void *arg, uint8_t *data, size_t len) {
   AwsFrameInfo *info = static_cast<AwsFrameInfo *>(arg);
   if (!(info->final && info->index == 0 && info->opcode == WS_TEXT)) {
     return;
@@ -363,8 +446,11 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t len) {
   // Forward to the common processor below.
   // Note: keep this lightweight — heavy work happens in the shared function.
   // We'll implement processTextPayload(...) elsewhere in this file.
-  extern void processTextPayload(const char *payload);
-  processTextPayload(payload);
+  extern bool processTextPayload(const char *payload);
+  if (processTextPayload(payload)) {
+    // Send ACK for flow control (only if processed/enqueued)
+    client->text("ACK");
+  }
 }
 
 void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type,
@@ -383,7 +469,7 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
       break;
     }
     case WS_EVT_DATA:
-      handleWebSocketMessage(arg, data, len);
+      handleWebSocketMessage(client, arg, data, len);
       break;
     case WS_EVT_PONG:
     case WS_EVT_ERROR:
@@ -393,11 +479,11 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
 
 // Shared processor for text payloads coming from WebSocket or Serial.
 // Accepts null-terminated payload strings (max ~127 chars).
-void processTextPayload(const char *payload) {
-  if (!payload) return;
+bool processTextPayload(const char *payload) {
+  if (!payload) return false;
   size_t len = strlen(payload);
   if (len == 0 || len >= 128) {
-    return;
+    return false;
   }
 
   // Check for command messages (start with "cmd:")
@@ -409,63 +495,63 @@ void processTextPayload(const char *payload) {
       // implemented below as logStatus()
       extern void logStatus();
       logStatus();
-      return;
+      return true;
     }
 
     if (strcmp(cmd, "disable_motors") == 0) {
       motorsEnabled = false;
       logGeneral("Motors disabled");
-      return;
+      return true;
     } else if (strcmp(cmd, "enable_motors") == 0) {
       motorsEnabled = true;
       logGeneral("Motors enabled");
-      return;
+      return true;
     } else if (strcmp(cmd, "disable_logs_canvas") == 0) {
       enableLogCanvasOutput = false;
       logGeneral("Canvas logging disabled");
-      return;
+      return true;
     } else if (strcmp(cmd, "enable_logs_canvas") == 0) {
       enableLogCanvasOutput = true;
       logGeneral("Canvas logging enabled");
-      return;
+      return true;
     } else if (strcmp(cmd, "disable_logs_motor") == 0) {
       enableLogMotorCommands = false;
       logGeneral("Motor command logging disabled");
-      return;
+      return true;
     } else if (strcmp(cmd, "enable_logs_motor") == 0) {
       enableLogMotorCommands = true;
       logGeneral("Motor command logging enabled");
-      return;
+      return true;
     } else if (strcmp(cmd, "disable_logs_general") == 0) {
       enableLogGeneral = false;
       Serial.println("[INFO] General logging disabled");
-      return;
+      return true;
     } else if (strcmp(cmd, "enable_logs_general") == 0) {
       enableLogGeneral = true;
       Serial.println("[INFO] General logging enabled");
-      return;
+      return true;
     } else if (strcmp(cmd, "disable_logs_all") == 0) {
       enableLogCanvasOutput = false;
       enableLogMotorCommands = false;
       enableLogGeneral = false;
       Serial.println("[INFO] All logging disabled");
-      return;
+      return true;
     } else if (strcmp(cmd, "enable_logs_all") == 0) {
       enableLogCanvasOutput = true;
       enableLogMotorCommands = true;
       enableLogGeneral = true;
       Serial.println("[INFO] All logging enabled");
-      return;
+      return true;
     }
     // Unknown command, ignore
-    return;
+    return false;
   }
 
   // Parse drawing coordinates (format: "x&y-pen")
   const char *amp = strchr(payload, '&');
   const char *dash = strchr(payload, '-');
   if (!amp || !dash || dash <= amp) {
-    return;
+    return false;
   }
 
   int32_t xPixels = atoi(payload);
@@ -482,7 +568,7 @@ void processTextPayload(const char *payload) {
   // Log motor commands
   logMotorCommands(xSteps, ySteps, penDown);
 
-  queueTargetSteps(xSteps, ySteps, penDown);
+  return queueTargetSteps(xSteps, ySteps, penDown);
 }
 
 // Print a detailed status summary (metadata + available commands).
@@ -547,6 +633,7 @@ void initWiFi() {
 }
 
 void configureSteppers() {
+  // Speed and acceleration are in steps per second
   stepperX.setMaxSpeed(MAX_SPEED_STEPS_PER_SEC);
   stepperX.setAcceleration(ACCEL_STEPS_PER_SEC2);
   stepperY.setMaxSpeed(MAX_SPEED_STEPS_PER_SEC);
@@ -564,24 +651,28 @@ int32_t absDiff(int32_t a, int32_t b) {
 }
 
 void applyQueuedTarget() {
+  if (stepperX.distanceToGo() != 0 || stepperY.distanceToGo() != 0) {
+    return;
+  }
+
   bool hasTarget = false;
-  int32_t targetX = 0;
-  int32_t targetY = 0;
-  bool targetPen = false;
+  PlotCmd cmd;
 
   portENTER_CRITICAL(&targetMux);
-  if (newTargetQueued) {
+  if (qHead != qTail) {
     hasTarget = true;
-    targetX = queuedTargetX;
-    targetY = queuedTargetY;
-    targetPen = queuedPenDown;
-    newTargetQueued = false;
+    cmd = cmdQueue[qTail];
+    qTail = (qTail + 1) % QUEUE_CAPACITY;
   }
   portEXIT_CRITICAL(&targetMux);
 
   if (!hasTarget) {
     return;
   }
+
+  int32_t targetX = cmd.xSteps;
+  int32_t targetY = cmd.ySteps;
+  bool targetPen = cmd.penDown;
 
   if (!motorsEnabled) {
     // Motors disabled - skip motor updates but still update pen if needed
@@ -662,4 +753,3 @@ void loop() {
 
   ws.cleanupClients();
 }
-
