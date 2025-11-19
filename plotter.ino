@@ -340,7 +340,12 @@ const char index_html[] PROGMEM = R"rawliteral(
       const windowW = window.innerWidth;
       const windowH = window.innerHeight;
       
-      const plotterAspect = PLOTTER_MAX_X / PLOTTER_MAX_Y;
+      const widthSteps = Math.abs(calMaxX - calMinX);
+      const heightSteps = Math.abs(calMaxY - calMinY);
+      const plotterAspect = (widthSteps > 0 && heightSteps > 0) 
+                            ? widthSteps / heightSteps 
+                            : PLOTTER_MAX_X / PLOTTER_MAX_Y;
+      
       const windowAspect = windowW / windowH;
       
       let w, h;
@@ -403,6 +408,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             minX: calMinX, minY: calMinY, maxX: calMaxX, maxY: calMaxY
           }));
           pendingCalType = null;
+          resizeCanvas();
         }
       };
     }
