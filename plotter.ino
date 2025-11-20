@@ -91,7 +91,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     button:disabled { opacity: 0.5; cursor: not-allowed; }
     #status { margin-left: auto; font-size: 14px; opacity: 0.85; }
     #canvas { display: block; width: 100vw; height: 100vh; cursor: crosshair; touch-action: none; position: fixed; top: 0; left: 0; }
-    #settingsPanel { position: fixed; top: 60px; right: 16px; background: rgba(0, 0, 0, 0.9); backdrop-filter: blur(12px); border: 1px solid #333; border-radius: 12px; padding: 20px; min-width: 240px; z-index: 20; display: none; box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5); max-height: calc(100vh - 80px); overflow-y: auto; }
+    #settingsPanel { position: fixed; top: 40px; right: 16px; background: rgba(0, 0, 0, 0.9); backdrop-filter: blur(12px); border: 1px solid #333; border-radius: 12px; padding: 20px; min-width: 240px; z-index: 20; display: none; box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5); max-height: calc(100vh - 80px); overflow-y: auto; }
     #settingsPanel.open { display: block; }
     .settings-group { margin-bottom: 20px; padding-bottom: 15px; border-bottom: 1px solid #333; }
     .settings-group:last-child { margin-bottom: 0; border-bottom: none; }
@@ -345,30 +345,19 @@ const char index_html[] PROGMEM = R"rawliteral(
       currentDpr = Math.max(1, window.devicePixelRatio || 1);
       
       const windowW = window.innerWidth;
-      const windowH = window.innerHeight;
       
-      const widthSteps = Math.abs(calMaxX - calMinX);
-      const heightSteps = Math.abs(calMaxY - calMinY);
-      const plotterAspect = (widthSteps > 0 && heightSteps > 0) 
-                            ? widthSteps / heightSteps 
-                            : PLOTTER_MAX_X / PLOTTER_MAX_Y;
+      // Always use physical limits for aspect ratio to prevent resizing during calibration
+      const plotterAspect = PLOTTER_MAX_X / PLOTTER_MAX_Y;
       
-      const windowAspect = windowW / windowH;
-      
-      let w, h;
-      if (windowAspect > plotterAspect) {
-        h = windowH;
-        w = h * plotterAspect;
-      } else {
-        w = windowW;
-        h = w / plotterAspect;
-      }
+      // Make canvas width of the screen
+      let w = windowW;
+      let h = w / plotterAspect;
 
       canvas.style.width = w + 'px';
       canvas.style.height = h + 'px';
       canvas.style.position = 'absolute';
-      canvas.style.left = (windowW - w) / 2 + 'px';
-      canvas.style.top = (windowH - h) / 2 + 'px';
+      canvas.style.left = '0px';
+      canvas.style.top = (h < window.innerHeight) ? (window.innerHeight - h) / 2 + 'px' : '0px';
 
       canvas.width = Math.round(w * currentDpr);
       canvas.height = Math.round(h * currentDpr);
@@ -531,6 +520,16 @@ const char index_html[] PROGMEM = R"rawliteral(
         try {
             for (let pt of points) {
                 sendSinglePoint(pt);
+                await new Promise(resolve => {
+                    ackResolver = resolve;
+                    setTimeout(resolve, 2000);
+                });
+            }
+            // Pick up the pen at the end of the round
+            if (points.length > 0) {
+                const lastPoint = points[points.length - 1];
+                // Send pen-up command at the last position
+                sendSinglePoint({ x: lastPoint.x, y: lastPoint.y, pen: 0 });
                 await new Promise(resolve => {
                     ackResolver = resolve;
                     setTimeout(resolve, 2000);
@@ -1316,7 +1315,7 @@ void checkIdleStatus() {
 
 void homeAxis(AccelStepper &stepper, ezButton &limitSwitch, int direction) {
   float originalMaxSpeed = stepper.maxSpeed();
-  stepper.setMaxSpeed(100.0 * MICROSTEP_MULTIPLIER); // Slow speed for homing (multiply by microstepping)
+  stepper.setMaxSpeed(500.0 * MICROSTEP_MULTIPLIER); // Homing speed (multiply by microstepping)
 
   // Move indefinitely in the homing direction (multiply by microstepping)
   stepper.moveTo(direction * 100000 * MICROSTEP_MULTIPLIER);
