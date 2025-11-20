@@ -70,8 +70,6 @@ volatile size_t qTail = 0;
 
 // Control flags
 bool motorsEnabled = true;
-bool enableLogCanvasOutput = true;
-bool enableLogMotorCommands = true;
 bool enableLogGeneral = true;
 
 const char index_html[] PROGMEM = R"rawliteral(
@@ -867,19 +865,6 @@ int32_t pixelsToStepsY(int32_t pixels) {
   return clampValue<int32_t>(steps, Y_MIN_STEPS, Y_MAX_STEPS);
 }
 
-void logCanvasOutput(int32_t xPixels, int32_t yPixels, bool penDown) {
-  if (enableLogCanvasOutput) {
-    Serial.printf("[CANVAS] x=%d y=%d pen=%s\n", xPixels, yPixels,
-                  penDown ? "DOWN" : "UP");
-  }
-}
-
-void logMotorCommands(int32_t xSteps, int32_t ySteps, bool penDown) {
-  if (enableLogMotorCommands) {
-    Serial.printf("[MOTOR] X=%d Y=%d pen=%s\n", xSteps, ySteps,
-                  penDown ? "DOWN" : "UP");
-  }
-}
 
 void logGeneral(const char *message) {
   if (enableLogGeneral) {
@@ -981,22 +966,6 @@ bool processTextPayload(const char *payload) {
       motorsEnabled = true;
       logGeneral("Motors enabled");
       return true;
-    } else if (strcmp(cmd, "disable_logs_canvas") == 0) {
-      enableLogCanvasOutput = false;
-      logGeneral("Canvas logging disabled");
-      return true;
-    } else if (strcmp(cmd, "enable_logs_canvas") == 0) {
-      enableLogCanvasOutput = true;
-      logGeneral("Canvas logging enabled");
-      return true;
-    } else if (strcmp(cmd, "disable_logs_motor") == 0) {
-      enableLogMotorCommands = false;
-      logGeneral("Motor command logging disabled");
-      return true;
-    } else if (strcmp(cmd, "enable_logs_motor") == 0) {
-      enableLogMotorCommands = true;
-      logGeneral("Motor command logging enabled");
-      return true;
     } else if (strcmp(cmd, "disable_logs_general") == 0) {
       enableLogGeneral = false;
       Serial.println("[INFO] General logging disabled");
@@ -1006,14 +975,10 @@ bool processTextPayload(const char *payload) {
       Serial.println("[INFO] General logging enabled");
       return true;
     } else if (strcmp(cmd, "disable_logs_all") == 0) {
-      enableLogCanvasOutput = false;
-      enableLogMotorCommands = false;
       enableLogGeneral = false;
       Serial.println("[INFO] All logging disabled");
       return true;
     } else if (strcmp(cmd, "enable_logs_all") == 0) {
-      enableLogCanvasOutput = true;
-      enableLogMotorCommands = true;
       enableLogGeneral = true;
       Serial.println("[INFO] All logging enabled");
       return true;
@@ -1073,9 +1038,6 @@ bool processTextPayload(const char *payload) {
   int penValue = atoi(dash + 1);
   bool penDown = penValue > 0;
 
-  // Log canvas output
-  logCanvasOutput(xPixels, yPixels, penDown);
-
   // Direct mapping: inputs are already in microsteps from JS
   int32_t xSteps = xPixels;
   int32_t ySteps = yPixels;
@@ -1083,10 +1045,6 @@ bool processTextPayload(const char *payload) {
   // Clamp just in case
   xSteps = clampValue<int32_t>(xSteps, X_MIN_STEPS, X_MAX_STEPS);
   ySteps = clampValue<int32_t>(ySteps, Y_MIN_STEPS, Y_MAX_STEPS);
-
-  // Log motor commands
-  logMotorCommands(xSteps, ySteps, penDown);
-
   return queueTargetSteps(xSteps, ySteps, penDown);
 }
 
@@ -1114,9 +1072,7 @@ void logStatus() {
                 SERVO_PIN, PEN_UP_ANGLE, PEN_DOWN_ANGLE);
 
   // Logging flags
-  Serial.printf("Logging - canvas: %s, motor: %s, general: %s\n",
-                enableLogCanvasOutput ? "ON" : "OFF",
-                enableLogMotorCommands ? "ON" : "OFF",
+  Serial.printf("Logging: %s\n",
                 enableLogGeneral ? "ON" : "OFF");
 
   // Available commands
@@ -1124,10 +1080,6 @@ void logStatus() {
   Serial.println("  cmd:status");
   Serial.println("  cmd:disable_motors");
   Serial.println("  cmd:enable_motors");
-  Serial.println("  cmd:disable_logs_canvas");
-  Serial.println("  cmd:enable_logs_canvas");
-  Serial.println("  cmd:disable_logs_motor");
-  Serial.println("  cmd:enable_logs_motor");
   Serial.println("  cmd:disable_logs_general");
   Serial.println("  cmd:enable_logs_general");
   Serial.println("  cmd:disable_logs_all");
@@ -1315,7 +1267,7 @@ void checkIdleStatus() {
 
 void homeAxis(AccelStepper &stepper, ezButton &limitSwitch, int direction) {
   float originalMaxSpeed = stepper.maxSpeed();
-  stepper.setMaxSpeed(500.0 * MICROSTEP_MULTIPLIER); // Homing speed (multiply by microstepping)
+  stepper.setMaxSpeed(250.0 * MICROSTEP_MULTIPLIER); // Homing speed (multiply by microstepping)
 
   // Move indefinitely in the homing direction (multiply by microstepping)
   stepper.moveTo(direction * 100000 * MICROSTEP_MULTIPLIER);
