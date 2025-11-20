@@ -22,7 +22,7 @@ constexpr int Y_LIMIT_PIN = 22;
 
 // Servo configuration
 constexpr int SERVO_PIN = 27;
-constexpr int PEN_UP_ANGLE = 90;
+constexpr int PEN_UP_ANGLE = 130;
 int PEN_DOWN_ANGLE = 45; // Mutable for runtime adjustment
 
 // Microstepping configuration
@@ -63,7 +63,9 @@ struct PlotCmd {
   bool penDown;
 };
 
-constexpr size_t QUEUE_CAPACITY = 500;
+// Increased buffer size to prevent "Full" stalls during large drawings
+// 4000 points is enough for a very complex drawing if optimized.
+constexpr size_t QUEUE_CAPACITY = 4000;
 PlotCmd cmdQueue[QUEUE_CAPACITY];
 volatile size_t qHead = 0;
 volatile size_t qTail = 0;
@@ -375,8 +377,18 @@ const char index_html[] PROGMEM = R"rawliteral(
       websocket.onmessage = (event) => {
         if (event.data === "ACK") {
           if (ackResolver) {
-            ackResolver();
+            ackResolver("ACK");
             ackResolver = null;
+          }
+        } else if (event.data === "FULL") {
+          if (ackResolver) {
+            ackResolver("FULL");
+            ackResolver = null;
+          }
+        } else if (event.data === "status:idle") {
+          if (idleResolver) {
+            idleResolver();
+            idleResolver = null;
           }
         } else if (event.data.startsWith("pos:")) {
           const parts = event.data.substring(4).split(',');
@@ -461,11 +473,8 @@ const char index_html[] PROGMEM = R"rawliteral(
             }
             sourcePoints = pointsBuffer;
         } else if (gameState === 'ROUND_DONE') {
-            if (nextRoundBuffer.length > 0) {
-                sourcePoints = nextRoundBuffer;
-            } else if (pointsBuffer.length > 0) {
-                sourcePoints = pointsBuffer;
-            }
+            // Combine buffers to catch points drawn during replay AND after
+            sourcePoints = nextRoundBuffer.concat(pointsBuffer);
             
             if (sourcePoints.length === 0) {
                 alert("No input detected from last round!");
@@ -511,25 +520,25 @@ const char index_html[] PROGMEM = R"rawliteral(
         
         try {
             for (let pt of points) {
-                sendSinglePoint(pt);
-                await new Promise(resolve => {
-                    ackResolver = resolve;
-                    setTimeout(resolve, 2000);
-                });
+                await sendSinglePoint(pt);
             }
             // Pick up the pen at the end of the round
             if (points.length > 0) {
                 const lastPoint = points[points.length - 1];
                 // Send pen-up command at the last position
-                sendSinglePoint({ x: lastPoint.x, y: lastPoint.y, pen: 0 });
+                await sendSinglePoint({ x: lastPoint.x, y: lastPoint.y, pen: 0 });
+                
+                // Wait for hardware to finish executing pen-up command (queue empty, motors stopped)
+                // The drawing can take a long time (minutes) if the buffer is full.
                 await new Promise(resolve => {
-                    ackResolver = resolve;
-                    setTimeout(resolve, 2000);
+                    idleResolver = resolve;
+                    // Set a very long timeout (10 minutes) to prevent premature "Round Complete"
+                    setTimeout(() => {
+                        console.warn("Drawing timeout reached (10m)");
+                        resolve("TIMEOUT");
+                    }, 600000); 
                 });
             }
-            // Wait for final "Idle" or empty queue from firmware? 
-            // For now, we rely on the ACK loop finishing.
-            // Ideally, we wait for a "JobDone" message.
         } catch (e) {
             console.error(e);
         } finally {
@@ -578,17 +587,21 @@ const char index_html[] PROGMEM = R"rawliteral(
       
       if (targetBuffer.length > 0) {
         const last = targetBuffer[targetBuffer.length - 1];
-        if (pen === last.pen &&
-            Math.abs(x - last.x) < 1 &&
-            Math.abs(y - last.y) < 1 &&
-            now - last.time < 10) {
-          return;
+        
+        // Filter out small movements to prevent "jerky" robot motion
+        // A minimum distance of 4 pixels ensures longer, smoother stepper segments.
+        const dx = x - last.x;
+        const dy = y - last.y;
+        const dist = Math.sqrt(dx*dx + dy*dy);
+        
+        if (pen === last.pen && dist < 4.0) {
+          return; // Skip point (too close)
         }
       }
       targetBuffer.push({ x, y, pen, time: now });
     }
 
-    function sendSinglePoint(pt) {
+    async function sendSinglePoint(pt) {
       if (!websocket || websocket.readyState !== WebSocket.OPEN) return;
       
       // Map canvas coordinates to plotter steps using CALIBRATION BOUNDS
@@ -616,7 +629,29 @@ const char index_html[] PROGMEM = R"rawliteral(
       // normY=1 (bottom) -> targetY should be MIN (at switch)
       const targetY = Math.round(calMinY + (normY * rangeY));
 
-      websocket.send(`${targetX}&${targetY}-${pt.pen}`);
+      const payload = `${targetX}&${targetY}-${pt.pen}`;
+      
+      // Reliable send with retry logic to prevent "slower and slower" stalls
+      while(true) {
+          websocket.send(payload);
+          
+          const result = await new Promise(resolve => {
+              ackResolver = resolve;
+              // Timeout logic to catch dropped packets
+              setTimeout(() => resolve("TIMEOUT"), 2000);
+          });
+          
+          if (result === "ACK") {
+              break; // Success
+          } else if (result === "FULL") {
+              // Queue full, wait briefly then retry
+              await new Promise(r => setTimeout(r, 100));
+          } else {
+              // Timeout, likely packet loss or queue silent drop (shouldn't happen with "FULL" logic but safe to retry)
+              console.warn("Ack timeout, retrying point...");
+              await new Promise(r => setTimeout(r, 100));
+          }
+      }
     }
     
     async function submitDrawing() {
@@ -633,12 +668,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         
         try {
             for (let pt of pointsBuffer) {
-                sendSinglePoint(pt);
-                await new Promise(resolve => {
-                    ackResolver = resolve;
-                    // Timeout fallback just in case
-                    setTimeout(resolve, 2000);
-                });
+                await sendSinglePoint(pt);
             }
             updateStatus('Sent!', true);
         } catch (e) {
@@ -893,10 +923,15 @@ void handleWebSocketMessage(AsyncWebSocketClient *client, void *arg,
   // common processor below. Note: keep this lightweight — heavy work happens in
   // the shared function. We'll implement processTextPayload(...) elsewhere in
   // this file.
-  extern bool processTextPayload(const char *payload);
-  if (processTextPayload(payload)) {
+  extern int processTextPayload(const char *payload);
+  int result = processTextPayload(payload);
+  
+  if (result == 1) {
     // Send ACK for flow control (only if processed/enqueued)
     client->text("ACK");
+  } else if (result == 2) {
+    // Queue full
+    client->text("FULL");
   }
 }
 
@@ -927,12 +962,13 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
 
 // Shared processor for text payloads coming from WebSocket or Serial.
 // Accepts null-terminated payload strings (max ~127 chars).
-bool processTextPayload(const char *payload) {
+// Returns: 0=Fail, 1=Success, 2=QueueFull
+int processTextPayload(const char *payload) {
   if (!payload)
-    return false;
+    return 0;
   size_t len = strlen(payload);
   if (len == 0 || len >= 128) {
-    return false;
+    return 0;
   }
 
   // Check for command messages (start with "cmd:")
@@ -944,13 +980,13 @@ bool processTextPayload(const char *payload) {
       // implemented below as logStatus()
       extern void logStatus();
       logStatus();
-      return true;
+      return 1;
     }
 
     if (strcmp(cmd, "disable_motors") == 0) {
       motorsEnabled = false;
       logGeneral("Motors disabled");
-      return true;
+      return 1;
     } else if (strcmp(cmd, "enable_motors") == 0) {
       motorsEnabled = true;
       logGeneral("Motors enabled");
@@ -958,19 +994,19 @@ bool processTextPayload(const char *payload) {
     } else if (strcmp(cmd, "disable_logs_general") == 0) {
       enableLogGeneral = false;
       Serial.println("[INFO] General logging disabled");
-      return true;
+      return 1;
     } else if (strcmp(cmd, "enable_logs_general") == 0) {
       enableLogGeneral = true;
       Serial.println("[INFO] General logging enabled");
-      return true;
+      return 1;
     } else if (strcmp(cmd, "disable_logs_all") == 0) {
       enableLogGeneral = false;
       Serial.println("[INFO] All logging disabled");
-      return true;
+      return 1;
     } else if (strcmp(cmd, "enable_logs_all") == 0) {
       enableLogGeneral = true;
       Serial.println("[INFO] All logging enabled");
-      return true;
+      return 1;
     } else if (strncmp(cmd, "jog:", 4) == 0) {
       const char *args = cmd + 4;
       const char *comma = strchr(args, ',');
@@ -987,7 +1023,7 @@ bool processTextPayload(const char *payload) {
 
         queueTargetSteps(targetX, targetY, penCurrentlyDown);
       }
-      return true;
+      return 1;
     } else if (strncmp(cmd, "pen_angle:", 10) == 0) {
       int angle = atoi(cmd + 10);
       angle = clampValue(angle, 0, 180);
@@ -996,22 +1032,22 @@ bool processTextPayload(const char *payload) {
         penServo.write(PEN_DOWN_ANGLE);
       }
       Serial.printf("Pen down angle set to %d\n", PEN_DOWN_ANGLE);
-      return true;
+      return 1;
     } else if (strcmp(cmd, "pen_up") == 0) {
       updatePen(false);
       Serial.println("Pen raised");
-      return true;
+      return 1;
     } else if (strcmp(cmd, "pen_down") == 0) {
       updatePen(true);
       Serial.println("Pen lowered");
-      return true;
+      return 1;
     } else if (strcmp(cmd, "get_pos") == 0) {
        Serial.printf("pos:%ld,%ld\n", stepperX.currentPosition(), stepperY.currentPosition());
        // Also send to WebSocket
        char buf[64];
        snprintf(buf, sizeof(buf), "pos:%ld,%ld", stepperX.currentPosition(), stepperY.currentPosition());
        ws.textAll(buf);
-       return true;
+       return 1;
     }
   }
 
@@ -1019,7 +1055,7 @@ bool processTextPayload(const char *payload) {
   const char *amp = strchr(payload, '&');
   const char *dash = strchr(payload, '-');
   if (!amp || !dash || dash <= amp) {
-    return false;
+    return 0;
   }
 
   int32_t xPixels = atoi(payload);
@@ -1034,7 +1070,12 @@ bool processTextPayload(const char *payload) {
   // Clamp just in case
   xSteps = clampValue<int32_t>(xSteps, X_MIN_STEPS, X_MAX_STEPS);
   ySteps = clampValue<int32_t>(ySteps, Y_MIN_STEPS, Y_MAX_STEPS);
-  return queueTargetSteps(xSteps, ySteps, penDown);
+  
+  if (queueTargetSteps(xSteps, ySteps, penDown)) {
+      return 1;
+  } else {
+      return 2; // Queue Full
+  }
 }
 
 // Print a detailed status summary (metadata + available commands).
