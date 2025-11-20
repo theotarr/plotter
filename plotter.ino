@@ -94,7 +94,6 @@ const char index_html[] PROGMEM = R"rawliteral(
     .settings-group { margin-bottom: 20px; padding-bottom: 15px; border-bottom: 1px solid #333; }
     .settings-group:last-child { margin-bottom: 0; border-bottom: none; }
     .settings-label { display: block; font-size: 13px; margin-bottom: 8px; opacity: 0.9; font-weight: 500; }
-    #colorPicker { width: 100%; height: 40px; border: 1px solid #444; border-radius: 8px; cursor: pointer; background: transparent; }
     #strokeWidthInput { width: 100%; height: 36px; background: #1f1f1f; border: 1px solid #444; border-radius: 8px; color: inherit; font-size: 14px; padding: 0 12px; }
     #strokeWidthInput:focus { outline: none; border-color: #666; }
     .stroke-width-display { display: flex; align-items: center; gap: 10px; }
@@ -131,10 +130,6 @@ const char index_html[] PROGMEM = R"rawliteral(
     </div>
   </div>
   <div id="settingsPanel">
-    <div class="settings-group">
-      <label class="settings-label" for="colorPicker">Color</label>
-      <input type="color" id="colorPicker" value="#ff5252">
-    </div>
     <div class="settings-group">
       <label class="settings-label" for="strokeWidthSlider">Stroke Width</label>
       <div class="stroke-width-display">
@@ -204,7 +199,6 @@ const char index_html[] PROGMEM = R"rawliteral(
     const gameActionBtn = document.getElementById('gameActionBtn');
     const gameResetBtn = document.getElementById('gameResetBtn');
     
-    const colorPicker = document.getElementById('colorPicker');
     const strokeWidthSlider = document.getElementById('strokeWidthSlider');
     const strokeWidthInput = document.getElementById('strokeWidthInput');
     const strokeWidthValue = document.getElementById('strokeWidthValue');
@@ -730,11 +724,6 @@ const char index_html[] PROGMEM = R"rawliteral(
 
     settingsBtn.addEventListener('click', () => {
       settingsPanel.classList.toggle('open');
-    });
-
-    colorPicker.addEventListener('input', (e) => {
-      currentColor = e.target.value;
-      applyCanvasSettings();
     });
 
     function updateStrokeWidth(value) {
