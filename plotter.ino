@@ -427,6 +427,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     let gameState = 'IDLE'; // IDLE, RECORDING_USER, REPLAYING
     let nextRoundBuffer = [];
     let isReplaying = false;
+    let autoStartTimeout = null;
 
     gameBtn.addEventListener('click', () => {
         gameMode = !gameMode;
@@ -436,6 +437,11 @@ const char index_html[] PROGMEM = R"rawliteral(
     });
 
     function resetGame() {
+        // Clear any pending auto-start timeout
+        if (autoStartTimeout) {
+            clearTimeout(autoStartTimeout);
+            autoStartTimeout = null;
+        }
         gameState = 'IDLE';
         pointsBuffer = [];
         nextRoundBuffer = [];
@@ -463,14 +469,20 @@ const char index_html[] PROGMEM = R"rawliteral(
                 gameActionBtn.disabled = true;
                 break;
             case 'ROUND_DONE':
-                gameStatusText.textContent = "Round Complete. Next?";
+                gameStatusText.textContent = "Round Complete. Starting next round...";
                 gameActionBtn.textContent = "Start Next Round";
                 gameActionBtn.disabled = false;
                 break;
         }
     }
 
-    gameActionBtn.addEventListener('click', () => {
+    function startNextRound() {
+        // Clear any existing auto-start timeout
+        if (autoStartTimeout) {
+            clearTimeout(autoStartTimeout);
+            autoStartTimeout = null;
+        }
+        
         let sourcePoints = [];
         
         if (gameState === 'IDLE') {
@@ -505,6 +517,10 @@ const char index_html[] PROGMEM = R"rawliteral(
         redrawCanvas();
         
         startRobotRound(sourcePoints);
+    }
+
+    gameActionBtn.addEventListener('click', () => {
+        startNextRound();
     });
 
     gameResetBtn.addEventListener('click', resetGame);
@@ -554,6 +570,13 @@ const char index_html[] PROGMEM = R"rawliteral(
             gameState = 'ROUND_DONE';
             updateGameUI();
             updateStatus('Round Done', true);
+            
+            // Auto-start next round after 2 seconds
+            if (gameMode) {
+                autoStartTimeout = setTimeout(() => {
+                    startNextRound();
+                }, 2000);
+            }
         }
     }
 
@@ -875,7 +898,7 @@ int32_t pixelsToStepsX(int32_t pixels) {
     Serial.printf("[BOUNDS] X steps %ld exceeds maximum %ld (clamped)\n",
                   (long)steps, (long)X_MAX_STEPS);
   }
-  return clampValue<int32_t>(steps, X_MIN_STEPS, X_MAX_STEPS);
+  return steps;
 }
 
 int32_t pixelsToStepsY(int32_t pixels) {
@@ -888,7 +911,7 @@ int32_t pixelsToStepsY(int32_t pixels) {
     Serial.printf("[BOUNDS] Y steps %ld exceeds maximum %ld (clamped)\n",
                   (long)steps, (long)Y_MAX_STEPS);
   }
-  return clampValue<int32_t>(steps, Y_MIN_STEPS, Y_MAX_STEPS);
+  return steps;
 }
 
 
@@ -1024,10 +1047,6 @@ int processTextPayload(const char *payload) {
         int32_t targetX = stepperX.targetPosition() + dx;
         int32_t targetY = stepperY.targetPosition() + dy;
 
-        // Clamp to bounds
-        targetX = clampValue<int32_t>(targetX, X_MIN_STEPS, X_MAX_STEPS);
-        targetY = clampValue<int32_t>(targetY, Y_MIN_STEPS, Y_MAX_STEPS);
-
         queueTargetSteps(targetX, targetY, penCurrentlyDown);
       }
       return 1;
@@ -1073,10 +1092,6 @@ int processTextPayload(const char *payload) {
   // Direct mapping: inputs are already in microsteps from JS
   int32_t xSteps = xPixels;
   int32_t ySteps = yPixels;
-
-  // Clamp just in case
-  xSteps = clampValue<int32_t>(xSteps, X_MIN_STEPS, X_MAX_STEPS);
-  ySteps = clampValue<int32_t>(ySteps, Y_MIN_STEPS, Y_MAX_STEPS);
   
   if (queueTargetSteps(xSteps, ySteps, penDown)) {
       return 1;
