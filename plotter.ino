@@ -25,21 +25,24 @@ constexpr int SERVO_PIN = 27;
 constexpr int PEN_UP_ANGLE = 90;
 int PEN_DOWN_ANGLE = 45; // Mutable for runtime adjustment
 
+// Microstepping configuration
+constexpr int32_t MICROSTEP_MULTIPLIER = 16;
+
 // Motion calibration (tune for your machine)
 constexpr float STEPS_PER_PIXEL_X = 1.0f;
 constexpr float STEPS_PER_PIXEL_Y = 1.0f;
 constexpr int32_t X_OFFSET_STEPS = 0;
 constexpr int32_t Y_OFFSET_STEPS = 0;
 constexpr int32_t X_MIN_STEPS = 0;
-constexpr int32_t X_MAX_STEPS = 1200;
+constexpr int32_t X_MAX_STEPS = 1200 * MICROSTEP_MULTIPLIER;
 constexpr int32_t Y_MIN_STEPS = 0;
-constexpr int32_t Y_MAX_STEPS = 450;
+constexpr int32_t Y_MAX_STEPS = 460 * MICROSTEP_MULTIPLIER;
 
 // Motion dynamics
-constexpr float MAX_SPEED_STEPS_PER_SEC = 500.0f;
-constexpr float ACCEL_STEPS_PER_SEC2 = 250.0f;
+constexpr float MAX_SPEED_STEPS_PER_SEC = 800.0f * MICROSTEP_MULTIPLIER;
+constexpr float ACCEL_STEPS_PER_SEC2 = 300.0f * MICROSTEP_MULTIPLIER;
 constexpr int32_t MIN_STEP_DELTA = 1;
-constexpr int32_t LIMIT_SWITCH_BUFFER_STEPS = 20;
+constexpr int32_t LIMIT_SWITCH_BUFFER_STEPS = 20 * MICROSTEP_MULTIPLIER;
 
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
@@ -158,14 +161,18 @@ const char index_html[] PROGMEM = R"rawliteral(
           <button id="jogXPlus">▶</button>
         </div>
         <button id="jogYPlus">▼</button>
+        <div style="margin-top: 8px;">
+          <button id="penUp">Pen ↑</button>
+          <button id="penDown">Pen ↓</button>
+        </div>
       </div>
       <div class="instruction">Use Arrow Keys</div>
       <label class="settings-label" style="margin-top: 10px;">Jog Steps</label>
       <select id="jogStepSize" style="width: 100%; height: 30px; background: #1f1f1f; border: 1px solid #444; color: inherit; border-radius: 4px;">
-          <option value="1">1 Step</option>
-          <option value="10">10 Steps</option>
-          <option value="50">50 Steps</option>
-          <option value="100">100 Steps</option>
+          <option value="16">1 Step</option>
+          <option value="160">10 Steps</option>
+          <option value="800">50 Steps</option>
+          <option value="1600">100 Steps</option>
       </select>
     </div>
     <div class="settings-group">
@@ -213,9 +220,9 @@ const char index_html[] PROGMEM = R"rawliteral(
     const tlCoordEl = document.getElementById('tlCoord');
     const brCoordEl = document.getElementById('brCoord');
     
-    // Plotter physical limits (in steps)
-    const PLOTTER_MAX_X = 1200;
-    const PLOTTER_MAX_Y = 450;
+    // Plotter physical limits (in steps) - 16x Microstepping
+    const PLOTTER_MAX_X = 19200;
+    const PLOTTER_MAX_Y = 7200;
 
     // Calibration state
     let calMinX = 0;
@@ -793,6 +800,14 @@ const char index_html[] PROGMEM = R"rawliteral(
     document.getElementById('jogXMinus').addEventListener('click', () => sendJog(-1, 0));
     document.getElementById('jogXPlus').addEventListener('click', () => sendJog(1, 0));
 
+    function sendPenCommand(penDown) {
+      if (!websocket || websocket.readyState !== WebSocket.OPEN) return;
+      websocket.send(penDown ? 'cmd:pen_down' : 'cmd:pen_up');
+    }
+
+    document.getElementById('penUp').addEventListener('click', () => sendPenCommand(false));
+    document.getElementById('penDown').addEventListener('click', () => sendPenCommand(true));
+
     window.addEventListener('keydown', (e) => {
       if (!settingsPanel.classList.contains('open')) return;
 
@@ -1029,6 +1044,14 @@ bool processTextPayload(const char *payload) {
       }
       Serial.printf("Pen down angle set to %d\n", PEN_DOWN_ANGLE);
       return true;
+    } else if (strcmp(cmd, "pen_up") == 0) {
+      updatePen(false);
+      Serial.println("Pen raised");
+      return true;
+    } else if (strcmp(cmd, "pen_down") == 0) {
+      updatePen(true);
+      Serial.println("Pen lowered");
+      return true;
     } else if (strcmp(cmd, "get_pos") == 0) {
        Serial.printf("pos:%ld,%ld\n", stepperX.currentPosition(), stepperY.currentPosition());
        // Also send to WebSocket
@@ -1054,7 +1077,7 @@ bool processTextPayload(const char *payload) {
   // Log canvas output
   logCanvasOutput(xPixels, yPixels, penDown);
 
-  // Direct mapping: inputs are already in steps from JS
+  // Direct mapping: inputs are already in microsteps from JS
   int32_t xSteps = xPixels;
   int32_t ySteps = yPixels;
 
@@ -1180,8 +1203,8 @@ void applyQueuedTarget() {
   const int32_t currentX = stepperX.targetPosition();
   const int32_t currentY = stepperY.targetPosition();
 
-  const bool needXMove = (absDiff(targetX, currentX) >= MIN_STEP_DELTA);
-  const bool needYMove = (absDiff(targetY, currentY) >= MIN_STEP_DELTA);
+  const bool needXMove = (absDiff(targetX, currentX) >= (MIN_STEP_DELTA));
+  const bool needYMove = (absDiff(targetY, currentY) >= (MIN_STEP_DELTA));
 
   // Smart pen logic:
   // If pen is currently UP and target is DOWN: Move first, then put pen DOWN.
@@ -1293,10 +1316,10 @@ void checkIdleStatus() {
 
 void homeAxis(AccelStepper &stepper, ezButton &limitSwitch, int direction) {
   float originalMaxSpeed = stepper.maxSpeed();
-  stepper.setMaxSpeed(100.0); // Slow speed for homing
+  stepper.setMaxSpeed(100.0 * MICROSTEP_MULTIPLIER); // Slow speed for homing (multiply by microstepping)
 
-  // Move indefinitely in the homing direction
-  stepper.moveTo(direction * 100000);
+  // Move indefinitely in the homing direction (multiply by microstepping)
+  stepper.moveTo(direction * 100000 * MICROSTEP_MULTIPLIER);
 
   while (true) {
     limitSwitch.loop();
@@ -1310,7 +1333,7 @@ void homeAxis(AccelStepper &stepper, ezButton &limitSwitch, int direction) {
     }
   }
 
-  // Back off from the limit switch
+  // Back off from the limit switch (LIMIT_SWITCH_BUFFER_STEPS is already in microsteps)
   stepper.setCurrentPosition(0); // Temporarily set 0 at switch
   stepper.move(-direction * LIMIT_SWITCH_BUFFER_STEPS); // Move away
   while (stepper.distanceToGo() != 0) {
@@ -1334,7 +1357,7 @@ void measureAxisLength(AccelStepper &stepper, ezButton &limitSwitch,
 
   // 2. Move away to clear the switch
   Serial.println("Backing off from home...");
-  long backoffSteps = -homeDir * 100; // Move 100 steps away
+  long backoffSteps = -homeDir * 100 * MICROSTEP_MULTIPLIER; // Move 100 steps away (multiply by microstepping)
   stepper.move(backoffSteps);
   while (stepper.distanceToGo() != 0) {
     stepper.run();
@@ -1348,10 +1371,10 @@ void measureAxisLength(AccelStepper &stepper, ezButton &limitSwitch,
   // 3. Move to the other bound
   Serial.println("Moving to opposite bound...");
   float originalMaxSpeed = stepper.maxSpeed();
-  stepper.setMaxSpeed(200.0); // Slower for accuracy
+  stepper.setMaxSpeed(200.0 * MICROSTEP_MULTIPLIER); // Slower for accuracy (multiply by microstepping)
 
-  // Move effectively forever in opposite direction
-  stepper.moveTo(-homeDir * 1000000);
+  // Move effectively forever in opposite direction (multiply by microstepping)
+  stepper.moveTo(-homeDir * 1000000 * MICROSTEP_MULTIPLIER);
 
   while (true) {
     stepper.run();
