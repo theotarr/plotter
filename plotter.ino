@@ -23,7 +23,7 @@ constexpr int Y_LIMIT_PIN = 22;
 // Servo configuration
 constexpr int SERVO_PIN = 27;
 constexpr int PEN_UP_ANGLE = 130;
-int PEN_DOWN_ANGLE = 45; // Mutable for runtime adjustment
+int PEN_DOWN_ANGLE = 65; // Mutable for runtime adjustment
 
 // Microstepping configuration
 constexpr int32_t MICROSTEP_MULTIPLIER = 16;
@@ -54,6 +54,13 @@ Servo penServo;
 ezButton limitSwitchX(X_LIMIT_PIN);
 ezButton limitSwitchY(Y_LIMIT_PIN);
 bool penCurrentlyDown = false;
+
+// Servo smooth movement variables
+int currentServoAngle = PEN_UP_ANGLE;
+int targetServoAngle = PEN_UP_ANGLE;
+constexpr int SERVO_SPEED = 2; // Degrees per update (lower = slower, smoother)
+constexpr unsigned long SERVO_UPDATE_INTERVAL_MS = 20; // Update every 20ms
+unsigned long lastServoUpdate = 0;
 
 portMUX_TYPE targetMux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -1029,7 +1036,7 @@ int processTextPayload(const char *payload) {
       angle = clampValue(angle, 0, 180);
       PEN_DOWN_ANGLE = angle;
       if (penCurrentlyDown) {
-        penServo.write(PEN_DOWN_ANGLE);
+        targetServoAngle = PEN_DOWN_ANGLE;
       }
       Serial.printf("Pen down angle set to %d\n", PEN_DOWN_ANGLE);
       return 1;
@@ -1151,8 +1158,23 @@ void configureSteppers() {
 
 void updatePen(bool penDown) {
   const int targetAngle = penDown ? PEN_DOWN_ANGLE : PEN_UP_ANGLE;
-  penServo.write(targetAngle);
+  targetServoAngle = targetAngle;
   penCurrentlyDown = penDown;
+}
+
+void updateServoSmooth() {
+  unsigned long now = millis();
+  if (now - lastServoUpdate < SERVO_UPDATE_INTERVAL_MS) {
+    return; // Not time to update yet
+  }
+  lastServoUpdate = now;
+  
+  if (currentServoAngle != targetServoAngle) {
+    int diff = targetServoAngle - currentServoAngle;
+    int step = (abs(diff) > SERVO_SPEED) ? (diff > 0 ? SERVO_SPEED : -SERVO_SPEED) : diff;
+    currentServoAngle += step;
+    penServo.write(currentServoAngle);
+  }
 }
 
 int32_t absDiff(int32_t a, int32_t b) { return (a > b) ? (a - b) : (b - a); }
@@ -1401,7 +1423,10 @@ void setup() {
 
   // Initialize servo
   penServo.attach(SERVO_PIN);
-  updatePen(false);
+  currentServoAngle = PEN_UP_ANGLE;
+  targetServoAngle = PEN_UP_ANGLE;
+  penServo.write(PEN_UP_ANGLE);
+  penCurrentlyDown = false;
 
 
   // Initialize steppers
@@ -1445,6 +1470,9 @@ void loop() {
 
   stepperX.run();
   stepperY.run();
+  
+  // Update servo smoothly
+  updateServoSmooth();
   
   checkIdleStatus();
   
